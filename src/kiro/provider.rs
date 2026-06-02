@@ -9,6 +9,7 @@ use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -42,6 +43,59 @@ fn effective_max_concurrent() -> usize {
         .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
 }
 
+/// 并发快照：metrics 端点与结构化日志共用的真实并发度读数
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct ConcurrencySnapshot {
+    /// 并发上限（KIRO_MAX_CONCURRENT，与信号量初始 permit 数一致）
+    pub max: usize,
+    /// 当前在飞：已拿到名额、正在请求上游（= max - available）
+    pub in_use: usize,
+    /// 当前在信号量门口排队等待名额的请求数（自维护计数器）
+    pub waiting: usize,
+    /// 剩余可用名额
+    pub available: usize,
+}
+
+/// 并发监控句柄：可克隆，供 admin /metrics 端点读取实时并发度。
+/// 数据源与 provider 内部信号量完全一致（共享 Arc）。
+#[derive(Clone)]
+pub struct ConcurrencyMonitor {
+    semaphore: Arc<Semaphore>,
+    waiting: Arc<AtomicUsize>,
+    max: usize,
+}
+
+impl ConcurrencyMonitor {
+    /// 读取当前并发快照（瞬时值）
+    pub fn snapshot(&self) -> ConcurrencySnapshot {
+        let available = self.semaphore.available_permits();
+        let in_use = self.max.saturating_sub(available);
+        ConcurrencySnapshot {
+            max: self.max,
+            in_use,
+            waiting: self.waiting.load(Ordering::Relaxed),
+            available,
+        }
+    }
+}
+
+/// 排队计数守卫：进入 acquire 等待前 +1，离开（拿到名额或 future 被取消）时 -1。
+/// 用 Drop 保证 cancel-safe —— 客户端断连导致 await 被取消时计数器也能正确回退。
+struct WaitingGuard(Arc<AtomicUsize>);
+
+impl WaitingGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        WaitingGuard(counter)
+    }
+}
+
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -57,6 +111,10 @@ pub struct KiroProvider {
     tls_backend: TlsBackend,
     /// 并发控制信号量，限制同时发往上游的请求数
     concurrency_limit: Arc<Semaphore>,
+    /// 并发上限快照值（= 信号量初始 permit 数，用于计算 in_use）
+    concurrency_max: usize,
+    /// 在信号量门口排队等待名额的请求数（自维护计数器，tokio 不原生暴露）
+    concurrency_waiting: Arc<AtomicUsize>,
     /// RPM 追踪器（可选，用于记录账号维度的 RPM）
     rpm_tracker: Option<Arc<RpmTracker>>,
 }
@@ -86,6 +144,8 @@ impl KiroProvider {
             client_cache: Mutex::new(cache),
             tls_backend,
             concurrency_limit: Arc::new(Semaphore::new(max_concurrent)),
+            concurrency_max: max_concurrent,
+            concurrency_waiting: Arc::new(AtomicUsize::new(0)),
             rpm_tracker: None,
         }
     }
@@ -94,6 +154,35 @@ impl KiroProvider {
     pub fn with_rpm_tracker(mut self, tracker: Arc<RpmTracker>) -> Self {
         self.rpm_tracker = Some(tracker);
         self
+    }
+
+    /// 获取并发监控句柄（可克隆，供 admin /metrics 端点读取实时并发度）
+    pub fn concurrency_monitor(&self) -> ConcurrencyMonitor {
+        ConcurrencyMonitor {
+            semaphore: self.concurrency_limit.clone(),
+            waiting: self.concurrency_waiting.clone(),
+            max: self.concurrency_max,
+        }
+    }
+
+    /// 读取当前并发快照（瞬时值），用于结构化日志注入
+    fn concurrency_snapshot(&self) -> ConcurrencySnapshot {
+        let available = self.concurrency_limit.available_permits();
+        ConcurrencySnapshot {
+            max: self.concurrency_max,
+            in_use: self.concurrency_max.saturating_sub(available),
+            waiting: self.concurrency_waiting.load(Ordering::Relaxed),
+            available,
+        }
+    }
+
+    /// 申请并发名额：进入等待前 +1 排队计数，拿到名额（或被取消）后由 guard 自动 -1。
+    /// 集中在此处理排队埋点，两个调用点共用，cancel-safe。
+    async fn acquire_permit(&self) -> anyhow::Result<OwnedSemaphorePermit> {
+        let guard = WaitingGuard::new(self.concurrency_waiting.clone());
+        let permit = self.concurrency_limit.clone().acquire_owned().await?;
+        drop(guard);
+        Ok(permit)
     }
 
     /// 根据账号的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -349,7 +438,7 @@ impl KiroProvider {
 
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str, bound_ids: &[u64]) -> anyhow::Result<(reqwest::Response, u64, OwnedSemaphorePermit)> {
-        let permit = self.concurrency_limit.clone().acquire_owned().await?;
+        let permit = self.acquire_permit().await?;
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -502,7 +591,7 @@ impl KiroProvider {
         is_stream: bool,
         bound_ids: &[u64],
     ) -> anyhow::Result<(reqwest::Response, u64, OwnedSemaphorePermit)> {
-        let permit = self.concurrency_limit.clone().acquire_owned().await?;
+        let permit = self.acquire_permit().await?;
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -565,6 +654,20 @@ impl KiroProvider {
                 self.token_manager.report_success(ctx.id);
                 if let Some(rpm) = &self.rpm_tracker {
                     rpm.record_credential(ctx.id);
+                }
+                // 仅在有竞争时（名额满/有排队）记录成功路径的并发快照，
+                // 避免正常负载下翻倍热路径日志量（415MB 生产机敏感）。
+                let conc = self.concurrency_snapshot();
+                if conc.waiting > 0 || conc.in_use >= conc.max {
+                    tracing::info!(
+                        evt = "upstream_success",
+                        status_code = status.as_u16(),
+                        cred = ctx.id,
+                        conc_in_use = conc.in_use,
+                        conc_wait = conc.waiting,
+                        conc_max = conc.max,
+                        "上游成功（高并发）"
+                    );
                 }
                 return Ok((response, ctx.id, permit));
             }
@@ -637,10 +740,17 @@ impl KiroProvider {
 
             // 429 Too Many Requests - 限流：递增 success_count 让 Least-Used 算法轮转到下一个账号
             if status.as_u16() == 429 {
+                let conc = self.concurrency_snapshot();
                 tracing::warn!(
-                    "API 请求失败（上游限流，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
+                    evt = "upstream_throttled",
+                    status_code = 429,
+                    cred = ctx.id,
+                    attempt = attempt + 1,
+                    max_retries = max_retries,
+                    conc_in_use = conc.in_use,
+                    conc_wait = conc.waiting,
+                    conc_max = conc.max,
+                    "API 请求失败（上游限流）: {} {}",
                     status,
                     body
                 );
@@ -664,10 +774,17 @@ impl KiroProvider {
             // 408/5xx - 瞬态上游错误：重试但不禁用或切换账号
             // （避免 502 high load 等瞬态错误把所有账号锁死）
             if status.as_u16() == 408 || status.is_server_error() {
+                let conc = self.concurrency_snapshot();
                 tracing::warn!(
-                    "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
+                    evt = "upstream_error",
+                    status_code = status.as_u16(),
+                    cred = ctx.id,
+                    attempt = attempt + 1,
+                    max_retries = max_retries,
+                    conc_in_use = conc.in_use,
+                    conc_wait = conc.waiting,
+                    conc_max = conc.max,
+                    "API 请求失败（上游瞬态错误）: {} {}",
                     status,
                     body
                 );

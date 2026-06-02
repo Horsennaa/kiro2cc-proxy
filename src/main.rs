@@ -27,13 +27,21 @@ async fn main() {
     // 解析命令行参数
     let args = Args::parse();
 
-    // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // 初始化日志：默认纯文本；设 KIRO_LOG_JSON=1 切换为 JSON 行（便于 jq 解析并发埋点）
+    let log_json = std::env::var("KIRO_LOG_JSON")
+        .ok()
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE"))
+        .unwrap_or(false);
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if log_json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     // 加载配置
     let config_path = args
@@ -108,6 +116,9 @@ async fn main() {
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone())
         .with_rpm_tracker(rpm_tracker.clone());
 
+    // 在 provider 被移动进 anthropic 路由前，取出并发监控句柄（可克隆，共享信号量）
+    let concurrency_monitor = kiro_provider.concurrency_monitor();
+
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
         api_url: config.count_tokens_api_url.clone(),
@@ -175,6 +186,7 @@ async fn main() {
             let mut admin_state = admin::AdminState::new(admin_api_key_shared, admin_service)
                 .with_master_api_key(api_key_shared.clone())
                 .with_rpm_tracker(rpm_tracker.clone())
+                .with_concurrency_monitor(concurrency_monitor.clone())
                 .with_config_path(std::path::PathBuf::from(&config_path));
             if let Some(ref manager) = api_key_manager {
                 admin_state = admin_state.with_api_key_manager(manager.clone());

@@ -224,3 +224,30 @@ fn persist_auth_keys(
     std::fs::write(config_path, output)?;
     Ok(())
 }
+
+/// GET /api/admin/metrics
+/// 返回实时并发快照（信号量 in_use / waiting / available），用于调参与告警。
+/// 数据源与 provider 内部信号量一致；waiting 为自维护计数器（tokio 不原生暴露）。
+pub async fn get_metrics(State(state): State<AdminState>) -> impl IntoResponse {
+    match &state.concurrency_monitor {
+        Some(monitor) => {
+            let snap = monitor.snapshot();
+            Json(serde_json::json!({
+                "concurrency_max": snap.max,
+                "concurrency_in_use": snap.in_use,
+                "concurrency_waiting": snap.waiting,
+                "available_permits": snap.available,
+                "saturated": snap.in_use >= snap.max,
+            }))
+            .into_response()
+        }
+        None => {
+            let error = super::types::AdminErrorResponse::internal_error("并发监控未启用");
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!(error)),
+            )
+                .into_response()
+        }
+    }
+}
