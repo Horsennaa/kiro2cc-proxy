@@ -20,7 +20,7 @@ use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use crate::model::rpm::RpmTracker;
 use parking_lot::Mutex;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// 每个账号的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -28,8 +28,19 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
-/// 最大并发请求数（同时发往上游的请求上限）
-const MAX_CONCURRENT_REQUESTS: usize = 50;
+/// 最大并发请求数默认值（同时发往上游的请求上限）
+/// 可通过环境变量 KIRO_MAX_CONCURRENT 覆盖。单账号场景下默认走保守值，
+/// 减少瞬时并发撑爆单个 Kiro 账号。
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 6;
+
+/// 读取有效并发上限：优先环境变量 KIRO_MAX_CONCURRENT，非法/缺失时回退默认值
+fn effective_max_concurrent() -> usize {
+    std::env::var("KIRO_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
+}
 
 /// Kiro API Provider
 ///
@@ -66,12 +77,15 @@ impl KiroProvider {
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
+        let max_concurrent = effective_max_concurrent();
+        tracing::info!("并发上限 KIRO_MAX_CONCURRENT = {}（排队模式，超额请求等待名额）", max_concurrent);
+
         Self {
             token_manager,
             global_proxy: proxy,
             client_cache: Mutex::new(cache),
             tls_backend,
-            concurrency_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            concurrency_limit: Arc::new(Semaphore::new(max_concurrent)),
             rpm_tracker: None,
         }
     }
@@ -299,7 +313,7 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，不做解析
-    pub async fn call_api(&self, request_body: &str, bound_ids: &[u64]) -> anyhow::Result<(reqwest::Response, u64)> {
+    pub async fn call_api(&self, request_body: &str, bound_ids: &[u64]) -> anyhow::Result<(reqwest::Response, u64, OwnedSemaphorePermit)> {
         self.call_api_with_retry(request_body, false, bound_ids).await
     }
 
@@ -316,7 +330,7 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，调用方负责处理流式数据
-    pub async fn call_api_stream(&self, request_body: &str, bound_ids: &[u64]) -> anyhow::Result<(reqwest::Response, u64)> {
+    pub async fn call_api_stream(&self, request_body: &str, bound_ids: &[u64]) -> anyhow::Result<(reqwest::Response, u64, OwnedSemaphorePermit)> {
         self.call_api_with_retry(request_body, true, bound_ids).await
     }
 
@@ -329,13 +343,13 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response
-    pub async fn call_mcp(&self, request_body: &str, bound_ids: &[u64]) -> anyhow::Result<(reqwest::Response, u64)> {
+    pub async fn call_mcp(&self, request_body: &str, bound_ids: &[u64]) -> anyhow::Result<(reqwest::Response, u64, OwnedSemaphorePermit)> {
         self.call_mcp_with_retry(request_body, bound_ids).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str, bound_ids: &[u64]) -> anyhow::Result<(reqwest::Response, u64)> {
-        let _permit = self.concurrency_limit.acquire().await?;
+    async fn call_mcp_with_retry(&self, request_body: &str, bound_ids: &[u64]) -> anyhow::Result<(reqwest::Response, u64, OwnedSemaphorePermit)> {
+        let permit = self.concurrency_limit.clone().acquire_owned().await?;
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -394,7 +408,7 @@ impl KiroProvider {
                 if let Some(rpm) = &self.rpm_tracker {
                     rpm.record_credential(ctx.id);
                 }
-                return Ok((response, ctx.id));
+                return Ok((response, ctx.id, permit));
             }
 
             // 失败响应
@@ -487,8 +501,8 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         bound_ids: &[u64],
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
-        let _permit = self.concurrency_limit.acquire().await?;
+    ) -> anyhow::Result<(reqwest::Response, u64, OwnedSemaphorePermit)> {
+        let permit = self.concurrency_limit.clone().acquire_owned().await?;
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -552,7 +566,7 @@ impl KiroProvider {
                 if let Some(rpm) = &self.rpm_tracker {
                     rpm.record_credential(ctx.id);
                 }
-                return Ok((response, ctx.id));
+                return Ok((response, ctx.id, permit));
             }
 
             // 失败响应：读取 body 用于日志/错误信息
@@ -624,7 +638,7 @@ impl KiroProvider {
             // 429 Too Many Requests - 限流：递增 success_count 让 Least-Used 算法轮转到下一个账号
             if status.as_u16() == 429 {
                 tracing::warn!(
-                    "API 请求失败（上游限流，切换账号重试，尝试 {}/{}）: {} {}",
+                    "API 请求失败（上游限流，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
                     status,
@@ -639,8 +653,10 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                // 限流专用退避：比普通瞬态错误更长，避免单账号场景下
+                // 立即重试空转放大（一次真实限流被放大成多条 429 日志）
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    sleep(Self::throttle_delay(attempt)).await;
                 }
                 continue;
             }
@@ -708,6 +724,20 @@ impl KiroProvider {
         let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
         let backoff = exp.min(MAX_MS);
         let jitter_max = (backoff / 4).max(1);
+        let jitter = fastrand::u64(0..=jitter_max);
+        Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    /// 429 限流专用退避：起步更高、上限更大。
+    /// 单 Kiro 账号场景下，“切换账号”无账号可切，快速重试只会火上浇油。
+    /// 用较长退避让上游限流窗口过去，减少瞬时 429 空转放大。
+    fn throttle_delay(attempt: usize) -> Duration {
+        // 800ms 起步，指数退避到最多 15s，加抖动防雪崩
+        const BASE_MS: u64 = 800;
+        const MAX_MS: u64 = 15_000;
+        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
+        let backoff = exp.min(MAX_MS);
+        let jitter_max = (backoff / 3).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
     }
