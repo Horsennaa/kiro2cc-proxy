@@ -20,7 +20,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
-use tokio::time::{interval_at, Instant};
+use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
@@ -31,7 +31,7 @@ use super::websearch;
 
 /// GET /v1/ping
 ///
-/// 诊断端点（无需认证），返回请求的关键信息，用于排查客户端连接问题
+/// 诊断端点（无需认证），返回请求的关键信息，用于排查客户端连接问�?
 pub async fn ping(request: axum::http::Request<Body>) -> impl IntoResponse {
     let method = request.method().to_string();
     let uri = request.uri().to_string();
@@ -40,7 +40,7 @@ pub async fn ping(request: axum::http::Request<Body>) -> impl IntoResponse {
         .iter()
         .filter(|(name, _)| {
             let n = name.as_str();
-            // 只返回有用的 header，隐藏 API key
+            // 只返回有用的 header，隐�?API key
             n != "x-api-key" && n != "authorization"
         })
         .map(|(name, value)| {
@@ -70,7 +70,7 @@ fn map_provider_error_with_context(err: Error, model: &str, estimated_input_toke
             error = %err,
             model = %model,
             estimated_input_tokens = estimated_input_tokens,
-            "上游拒绝请求：上下文窗口已满（不应重试）— 请检查是否真正达到 1M 上下文限制"
+            "上游拒绝请求：上下文窗口已满（不应重试）�?请检查是否真正达�?1M 上下文限�?
         );
         return (
             StatusCode::BAD_REQUEST,
@@ -82,9 +82,9 @@ fn map_provider_error_with_context(err: Error, model: &str, estimated_input_toke
             .into_response();
     }
 
-    // 单次输入太长（请求体本身超出上游限制）
+    // 单次输入太长（请求体本身超出上游限制�?
     if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
+        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试�?);
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
@@ -94,12 +94,12 @@ fn map_provider_error_with_context(err: Error, model: &str, estimated_input_toke
         )
             .into_response();
     }
-    // 上游限流（429 Too Many Requests）：所有账号重试后仍被限流。
-    // 必须把 429 透传给客户端（而非转成 502），让 Claude Code 等客户端的
-    // 内置指数退避重试接管 —— 502 会被客户端判定为硬失败，导致"请求那一轮直接废掉"
-    // （表现为工具调用不执行 / 卡住），而 429 会触发客户端自动等待重试。
+    // 上游限流�?29 Too Many Requests）：所有账号重试后仍被限流�?
+    // 必须�?429 透传给客户端（而非转成 502），�?Claude Code 等客户端�?
+    // 内置指数退避重试接�?—�?502 会被客户端判定为硬失败，导致"请求那一轮直接废�?
+    // （表现为工具调用不执�?/ 卡住），�?429 会触发客户端自动等待重试�?
     if err_str.contains("429") || err_str.contains("Too Many Requests") {
-        tracing::warn!(error = %err, "上游限流（所有账号 429 耗尽）：透传 429 给客户端以触发其退避重试");
+        tracing::warn!(error = %err, "上游限流（所有账�?429 耗尽）：透传 429 给客户端以触发其退避重�?);
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, "5")],
@@ -122,19 +122,19 @@ fn map_provider_error_with_context(err: Error, model: &str, estimated_input_toke
         .into_response()
 }
 
-/// 从原始请求体反序列化 MessagesRequest，失败时记录详细的 serde 错误用于诊断。
+/// 从原始请求体反序列化 MessagesRequest，失败时记录详细�?serde 错误用于诊断�?
 ///
-/// 替代 axum 的 `Json<MessagesRequest>` 提取器——后者反序列化失败时直接返回 400
-/// 且不记录任何信息，导致无法定位是哪个字段/格式导致客户端请求被拒。
-/// 此函数在失败时打印 serde 错误（行列+字段路径）、body 长度、出错位置附近的片段。
+/// 替代 axum �?`Json<MessagesRequest>` 提取器——后者反序列化失败时直接返回 400
+/// 且不记录任何信息，导致无法定位是哪个字段/格式导致客户端请求被拒�?
+/// 此函数在失败时打�?serde 错误（行�?字段路径）、body 长度、出错位置附近的片段�?
 fn parse_messages_request(body: &[u8]) -> Result<MessagesRequest, Response> {
     match serde_json::from_slice::<MessagesRequest>(body) {
         Ok(req) => Ok(req),
         Err(e) => {
-            // serde_json 错误自带行列号；定位出错字节附近的片段辅助判断
+            // serde_json 错误自带行列号；定位出错字节附近的片段辅助判�?
             let line = e.line();
             let col = e.column();
-            // 估算出错字节偏移附近的上下文（按行列粗略定位，取该行附近 200 字节）
+            // 估算出错字节偏移附近的上下文（按行列粗略定位，取该行附近 200 字节�?
             let body_str = String::from_utf8_lossy(body);
             let snippet: String = body_str
                 .lines()
@@ -150,7 +150,7 @@ fn parse_messages_request(body: &[u8]) -> Result<MessagesRequest, Response> {
                 serde_col = col,
                 body_len = body.len(),
                 snippet = %snippet,
-                "[REQ-DIAG] /v1/messages 请求体反序列化失败（导致 400，客户端那轮中断）"
+                "[REQ-DIAG] /v1/messages 请求体反序列化失败（导致 400，客户端那轮中断�?
             );
             Err((
                 StatusCode::BAD_REQUEST,
@@ -166,7 +166,7 @@ fn parse_messages_request(body: &[u8]) -> Result<MessagesRequest, Response> {
 
 /// GET /v1/models
 ///
-/// 返回可用的模型列表
+/// 返回可用的模型列�?
 pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
@@ -176,11 +176,11 @@ pub async fn get_models() -> impl IntoResponse {
     })
 }
 
-/// 构建可用模型列表（供 get_models 和 get_model 共用）
+/// 构建可用模型列表（供 get_models �?get_model 共用�?
 fn build_model_list() -> Vec<Model> {
     vec![
-        // === 旧版模型 ID（兼容旧版 Claude Code 客户端） ===
-        // 这些旧 ID 在 map_model() 中会被正确映射到对应的 Kiro 模型
+        // === 旧版模型 ID（兼容旧�?Claude Code 客户端） ===
+        // 这些�?ID �?map_model() 中会被正确映射到对应�?Kiro 模型
         Model {
             id: "claude-3-5-sonnet-20241022".to_string(),
             object: "model".to_string(),
@@ -226,7 +226,7 @@ fn build_model_list() -> Vec<Model> {
             model_type: "chat".to_string(),
             max_tokens: 4096,
         },
-        // === Claude 4.x 过渡期模型 ID ===
+        // === Claude 4.x 过渡期模�?ID ===
         Model {
             id: "claude-sonnet-4-20250514".to_string(),
             object: "model".to_string(),
@@ -372,7 +372,7 @@ fn build_model_list() -> Vec<Model> {
             model_type: "chat".to_string(),
             max_tokens: 32000,
         },
-        // === 非 Claude 模型 ===
+        // === �?Claude 模型 ===
         Model {
             id: "auto".to_string(),
             object: "model".to_string(),
@@ -432,13 +432,13 @@ fn build_model_list() -> Vec<Model> {
 
 /// GET /v1/models/:model_id
 ///
-/// 返回指定模型的信息
+/// 返回指定模型的信�?
 pub async fn get_model(
     axum::extract::Path(model_id): axum::extract::Path<String>,
 ) -> Response {
     tracing::info!(model_id = %model_id, "Received GET /v1/models/:model_id request");
 
-    // 复用 get_models 的模型列表，查找匹配的模型
+    // 复用 get_models 的模型列表，查找匹配的模�?
     let models = build_model_list();
     if let Some(model) = models.into_iter().find(|m| m.id == model_id) {
         Json(model).into_response()
@@ -476,7 +476,7 @@ pub async fn post_messages(
         "Received POST /v1/messages request"
     );
 
-    // 记录 RPM（全局 + per-API-Key）
+    // 记录 RPM（全局 + per-API-Key�?
     if let Some(rpm_tracker) = &state.rpm_tracker {
         let api_key_id = identity.as_ref().map(|ext| ext.0.id);
         rpm_tracker.record_request(api_key_id);
@@ -487,11 +487,11 @@ pub async fn post_messages(
         .and_then(|ext| ext.0.bound_credential_ids.clone())
         .unwrap_or_default();
 
-    // 检查 KiroProvider 是否可用
+    // 检�?KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
         None => {
-            tracing::error!("KiroProvider 未配置");
+            tracing::error!("KiroProvider 未配�?);
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -503,7 +503,7 @@ pub async fn post_messages(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆�?thinking 配置
     override_thinking_from_model_name(&mut payload);
     tracing::info!(
         thinking_type = ?payload.thinking.as_ref().map(|t| t.thinking_type.as_str()),
@@ -532,7 +532,7 @@ pub async fn post_messages(
         Err(e) => {
             let (error_type, message) = match &e {
                 ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
+                    ("invalid_request_error", format!("模型不支�? {}", model))
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
@@ -556,12 +556,12 @@ pub async fn post_messages(
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
         Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
+            tracing::error!("序列化请求失�? {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "internal_error",
-                    format!("序列化请求失败: {}", e),
+                    format!("序列化请求失�? {}", e),
                 )),
             )
                 .into_response();
@@ -620,7 +620,7 @@ pub async fn post_messages(
         )
         .await
     } else {
-        // 非流式响应
+        // 非流式响�?
         handle_non_stream_request(
             provider,
             &request_body,
@@ -650,7 +650,7 @@ async fn handle_stream_request(
     bound_ids: Vec<u64>,
     client_ip: Option<String>,
 ) -> Response {
-    // 调用 Kiro API（支持多账号故障转移）
+    // 调用 Kiro API（支持多账号故障转移�?
     let (response, credential_id) = match provider.call_api_stream(request_body, &bound_ids).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error_with_context(e, model, input_tokens),
@@ -664,7 +664,7 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
-    // 创建 SSE 流
+    // 创建 SSE �?
     let stream = create_sse_stream(response, ctx, initial_events);
 
     // 返回 SSE 响应
@@ -677,19 +677,19 @@ async fn handle_stream_request(
         .unwrap()
 }
 
-/// Ping 事件间隔（25秒）
+/// Ping 事件间隔�?5秒）
 const PING_INTERVAL_SECS: u64 = 25;
 
-/// 创建 ping 事件的 SSE 字符串
+/// 创建 ping 事件�?SSE 字符�?
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
-/// 为上游空响应构造合适的 SSE error 事件。
+/// 为上游空响应构造合适的 SSE error 事件�?
 ///
-/// - 大输入（疑似上下文过大）：返回 invalid_request_error，提示压缩上下文，
-///   不鼓励原样重试（重试还是同样的大请求，仍会空）。
-/// - 小输入（疑似偶发）：返回 overloaded_error，客户端可重试。
+/// - 大输入（疑似上下文过大）：返�?invalid_request_error，提示压缩上下文�?
+///   不鼓励原样重试（重试还是同样的大请求，仍会空）�?
+/// - 小输入（疑似偶发）：返回 overloaded_error，客户端可重试�?
 fn empty_response_error_event(oversized_context: bool) -> SseEvent {
     let (err_type, message) = if oversized_context {
         (
@@ -712,38 +712,38 @@ fn empty_response_error_event(oversized_context: bool) -> SseEvent {
     )
 }
 
-/// 创建 SSE 事件流
+/// 创建 SSE 事件�?
 fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    // 先发送初始事件
+    // 先发送初始事�?
     let initial_stream = stream::iter(
         initial_events
             .into_iter()
             .map(|e| Ok(Bytes::from(e.to_sse_string()))),
     );
 
-    // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
+    // 然后处理 Kiro 响应流，同时�?5秒发�?ping 保活
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval_at(Instant::now() + Duration::from_secs(PING_INTERVAL_SECS), Duration::from_secs(PING_INTERVAL_SECS))),
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
         |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
             if finished {
                 return None;
             }
 
-            // 使用 select! 同时等待数据和 ping 定时器
+            // 使用 select! 同时等待数据�?ping 定时�?
             tokio::select! {
-                // 处理数据流
+                // 处理数据�?
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
+                                tracing::warn!("缓冲区溢�? {}", e);
                             }
 
                             let mut events = Vec::new();
@@ -761,7 +761,7 @@ fn create_sse_stream(
                                 }
                             }
 
-                            // 转换为 SSE 字节流
+                            // 转换�?SSE 字节�?
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -770,7 +770,7 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
+                            tracing::error!("读取响应流失�? {}", e);
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -782,15 +782,15 @@ fn create_sse_stream(
                         None => {
                             // 流结束。先检测上游是否返回了完全空的响应
                             // （超大上下文等场景上游会返回 200 + 空流），
-                            // 若空则补发 error 事件，而非静默的空 end_turn
-                            // （后者会让客户端表现为卡住/工具调用不执行）。
+                            // 若空则补�?error 事件，而非静默的空 end_turn
+                            // （后者会让客户端表现为卡�?工具调用不执行）�?
                             let mut out_events = Vec::new();
                             if ctx.is_empty_response() {
                                 let oversized = ctx.empty_response_is_oversized_context();
                                 tracing::warn!(
                                     oversized_context = oversized,
                                     est_input_tokens = ctx.input_tokens,
-                                    "上游返回空响应（无任何内容事件），补发 error 事件"
+                                    "上游返回空响应（无任何内容事件），补�?error 事件"
                                 );
                                 out_events.push(empty_response_error_event(oversized));
                             } else {
@@ -804,9 +804,9 @@ fn create_sse_stream(
                         }
                     }
                 }
-                // 发送 ping 保活
+                // 发�?ping 保活
                 _ = ping_interval.tick() => {
-                    tracing::trace!("发送 ping 保活事件");
+                    tracing::trace!("发�?ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
                     Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
                 }
@@ -818,10 +818,10 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-/// 上下文窗口大小（200K tokens）
+/// 上下文窗口大小（200K tokens�?
 const CONTEXT_WINDOW_SIZE: i32 = 200_000;
 
-/// 处理非流式请求
+/// 处理非流式请�?
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -834,17 +834,17 @@ async fn handle_non_stream_request(
     client_ip: Option<String>,
     json_schema_requested: bool,
 ) -> Response {
-    // 调用 Kiro API（支持多账号故障转移）
+    // 调用 Kiro API（支持多账号故障转移�?
     let (response, credential_id) = match provider.call_api(request_body, &bound_ids).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error_with_context(e, model, input_tokens),
     };
 
-    // 读取响应体
+    // 读取响应�?
     let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
+            tracing::error!("读取响应体失�? {}", e);
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -856,22 +856,22 @@ async fn handle_non_stream_request(
         }
     };
 
-    // 解析事件流
+    // 解析事件�?
     let mut decoder = EventStreamDecoder::new();
     if let Err(e) = decoder.feed(&body_bytes) {
-        tracing::warn!("缓冲区溢出: {}", e);
+        tracing::warn!("缓冲区溢�? {}", e);
     }
 
     let mut text_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
-    // 从 contextUsageEvent 计算的实际输入 tokens
+    // �?contextUsageEvent 计算的实际输�?tokens
     let mut context_input_tokens: Option<i32> = None;
     let mut metering_cache_read_tokens: Option<i32> = None;
     let mut metering_cache_creation_tokens: Option<i32> = None;
 
-    // 收集工具调用的增量 JSON
+    // 收集工具调用的增�?JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
@@ -886,7 +886,7 @@ async fn handle_non_stream_request(
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
 
-                            // 累积工具的 JSON 输入
+                            // 累积工具�?JSON 输入
                             let buffer = tool_json_buffers
                                 .entry(tool_use.tool_use_id.clone())
                                 .or_insert_with(String::new);
@@ -923,12 +923,12 @@ async fn handle_non_stream_request(
                                 / 100.0)
                                 as i32;
                             context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                            // 上下文使用量达到 100% 时，设置 stop_reason �?model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::info!(
-                                "[P0] contextUsageEvent: {:.2}% → input_tokens={} (200K窗口)",
+                                "[P0] contextUsageEvent: {:.2}% �?input_tokens={} (200K窗口)",
                                 context_usage.context_usage_percentage,
                                 actual_input_tokens
                             );
@@ -954,10 +954,10 @@ async fn handle_non_stream_request(
 
     // 确定 stop_reason：tool_use 优先级最高，存在工具调用时无条件覆盖
     // max_tokens / model_context_window_exceeded（这些是下一轮才该报告的状态，
-    // 不能盖掉本轮的 tool_use，否则客户端只渲染工具块而不执行）。
+    // 不能盖掉本轮�?tool_use，否则客户端只渲染工具块而不执行）�?
     if has_tool_use {
-        // [TOOLUSE-DIAG] 非流式工具调用收尾诊断：记录覆盖前的原始 stop_reason，
-        // 用于定位"客户端只显示 call 不执行"的根因。复现后离线分析。
+        // [TOOLUSE-DIAG] 非流式工具调用收尾诊断：记录覆盖前的原始 stop_reason�?
+        // 用于定位"客户端只显示 call 不执�?的根因。复现后离线分析�?
         tracing::warn!(
             "[TOOLUSE-DIAG] non_stream has_tool_use=true raw_stop_reason={} \
              tool_use_count={} final_stop_reason=tool_use",
@@ -967,7 +967,7 @@ async fn handle_non_stream_request(
         stop_reason = "tool_use".to_string();
     }
 
-    // JSON schema 结构化输出：去除模型可能添加的 Markdown 代码围栏
+    // JSON schema 结构化输出：去除模型可能添加�?Markdown 代码围栏
     if json_schema_requested && !text_content.is_empty() {
         text_content = strip_json_fences(text_content);
     }
@@ -987,18 +987,18 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
+    // 使用�?contextUsageEvent 计算�?input_tokens，如果没有则使用估算�?
     let raw_final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
     let final_input_tokens = super::stream::cap_input_tokens_pub(raw_final_input_tokens, input_tokens);
     tracing::info!(
-        "[P0] input_tokens 决策: context_event={:?} estimated={} final={} (context_event 有值说明 contextUsageEvent 正常工作)",
+        "[P0] input_tokens 决策: context_event={:?} estimated={} final={} (context_event 有值说�?contextUsageEvent 正常工作)",
         context_input_tokens, input_tokens, final_input_tokens
     );
 
-    // 对外报告的 output_tokens 限制在安全范围
+    // 对外报告�?output_tokens 限制在安全范�?
     let reported_output_tokens = output_tokens.min(380);
 
-    // 优先使用 meteringEvent 中的真实 cache token，无则降级到模拟值
+    // 优先使用 meteringEvent 中的真实 cache token，无则降级到模拟�?
     let sim_usage = prompt_cache_usage.scale_to(final_input_tokens);
     let (report_input, report_cache_creation, report_cache_read) =
         if let (Some(read), Some(creation)) = (metering_cache_read_tokens, metering_cache_creation_tokens) {
@@ -1039,8 +1039,8 @@ async fn handle_non_stream_request(
 
 /// 去除 JSON 响应中模型可能添加的 Markdown 代码围栏
 ///
-/// 当请求 JSON schema 结构化输出时，部分模型仍会将结果包裹在 ```json...``` 中。
-/// 此函数识别并剥离这些围栏，返回纯 JSON 文本。
+/// 当请�?JSON schema 结构化输出时，部分模型仍会将结果包裹�?```json...``` 中�?
+/// 此函数识别并剥离这些围栏，返回纯 JSON 文本�?
 fn strip_json_fences(text: String) -> String {
     let trimmed = text.trim();
     if !trimmed.starts_with("```") {
@@ -1086,11 +1086,11 @@ fn extract_client_ip(headers: &axum::http::HeaderMap, connect_info: Option<&std:
     connect_info.map(|addr| addr.ip().to_string())
 }
 
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+/// 检测模型名是否包含 "thinking" 后缀，若包含则覆�?thinking 配置
 ///
 /// - Opus 4.6：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// - budget_tokens 固定�?20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
@@ -1110,7 +1110,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     tracing::info!(
         model = %payload.model,
         thinking_type = thinking_type,
-        "模型名包含 thinking 后缀，覆写 thinking 配置"
+        "模型名包�?thinking 后缀，覆�?thinking 配置"
     );
 
     payload.thinking = Some(Thinking {
@@ -1128,7 +1128,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 
 /// POST /v1/messages/count_tokens
 ///
-/// 计算消息的 token 数量
+/// 计算消息�?token 数量
 pub async fn count_tokens(
     JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
 ) -> impl IntoResponse {
@@ -1153,8 +1153,8 @@ pub async fn count_tokens(
 /// POST /cc/v1/messages
 ///
 /// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
+/// - 流式响应会等�?kiro 端返�?contextUsageEvent 后再发�?message_start
+/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确�?
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     identity: Option<Extension<ApiKeyContext>>,
@@ -1174,11 +1174,11 @@ pub async fn post_messages_cc(
         "Received POST /cc/v1/messages request"
     );
 
-    // 检查 KiroProvider 是否可用
+    // 检�?KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
         None => {
-            tracing::error!("KiroProvider 未配置");
+            tracing::error!("KiroProvider 未配�?);
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -1190,7 +1190,7 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆�?thinking 配置
     override_thinking_from_model_name(&mut payload);
     tracing::info!(
         thinking_type = ?payload.thinking.as_ref().map(|t| t.thinking_type.as_str()),
@@ -1224,7 +1224,7 @@ pub async fn post_messages_cc(
         Err(e) => {
             let (error_type, message) = match &e {
                 ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
+                    ("invalid_request_error", format!("模型不支�? {}", model))
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
@@ -1248,12 +1248,12 @@ pub async fn post_messages_cc(
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
         Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
+            tracing::error!("序列化请求失�? {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "internal_error",
-                    format!("序列化请求失败: {}", e),
+                    format!("序列化请求失�? {}", e),
                 )),
             )
                 .into_response();
@@ -1312,7 +1312,7 @@ pub async fn post_messages_cc(
         )
         .await
     } else {
-        // 非流式响应（复用现有逻辑，已经使用正确的 input_tokens）
+        // 非流式响应（复用现有逻辑，已经使用正确的 input_tokens�?
         handle_non_stream_request(
             provider,
             &request_body,
@@ -1331,8 +1331,8 @@ pub async fn post_messages_cc(
 
 /// 处理流式请求（缓冲版本）
 ///
-/// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
-/// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
+/// �?`handle_stream_request` 不同，此函数会缓冲所有事件直到流结束�?
+/// 然后用从 contextUsageEvent 计算的正�?input_tokens 生成 message_start 事件�?
 async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1345,7 +1345,7 @@ async fn handle_stream_request_buffered(
     bound_ids: Vec<u64>,
     client_ip: Option<String>,
 ) -> Response {
-    // 调用 Kiro API（支持多账号故障转移）
+    // 调用 Kiro API（支持多账号故障转移�?
     let (response, credential_id) = match provider.call_api_stream(request_body, &bound_ids).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error_with_context(e, model, estimated_input_tokens),
@@ -1356,7 +1356,7 @@ async fn handle_stream_request_buffered(
         .with_usage_tracking(usage_tracker, api_key_id, Some(credential_id), client_ip)
         .with_prompt_cache_usage(prompt_cache_usage);
 
-    // 创建缓冲 SSE 流
+    // 创建缓冲 SSE �?
     let stream = create_buffered_sse_stream(response, ctx);
 
     // 返回 SSE 响应
@@ -1369,13 +1369,13 @@ async fn handle_stream_request_buffered(
         .unwrap()
 }
 
-/// 创建缓冲 SSE 事件流
+/// 创建缓冲 SSE 事件�?
 ///
-/// 工作流程：
-/// 1. 等待上游流完成，期间只发送 ping 保活信号
-/// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
-/// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
-/// 4. 一次性发送所有事件
+/// 工作流程�?
+/// 1. 等待上游流完成，期间只发�?ping 保活信号
+/// 2. 使用 StreamContext 的事件处理逻辑处理所�?Kiro 事件，结果缓�?
+/// 3. 流结束后，用正确�?input_tokens 更正 message_start 事件
+/// 4. 一次性发送所有事�?
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
@@ -1388,7 +1388,7 @@ fn create_buffered_sse_stream(
             ctx,
             EventStreamDecoder::new(),
             false,
-            interval_at(Instant::now() + Duration::from_secs(PING_INTERVAL_SECS), Duration::from_secs(PING_INTERVAL_SECS)),
+            interval(Duration::from_secs(PING_INTERVAL_SECS)),
         ),
         |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
             if finished {
@@ -1397,31 +1397,31 @@ fn create_buffered_sse_stream(
 
             loop {
                 tokio::select! {
-                    // 使用 biased 模式，优先检查 ping 定时器
-                    // 避免在上游 chunk 密集时 ping 被"饿死"
+                    // 使用 biased 模式，优先检�?ping 定时�?
+                    // 避免在上�?chunk 密集�?ping �?饿死"
                     biased;
 
-                    // 优先检查 ping 保活（等待期间唯一发送的数据）
+                    // 优先检�?ping 保活（等待期间唯一发送的数据�?
                     _ = ping_interval.tick() => {
-                        tracing::trace!("发送 ping 保活事件（缓冲模式）");
+                        tracing::trace!("发�?ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
                         return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
                     }
 
-                    // 然后处理数据流
+                    // 然后处理数据�?
                     chunk_result = body_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
+                                    tracing::warn!("缓冲区溢�? {}", e);
                                 }
 
                                 for result in decoder.decode_iter() {
                                     match result {
                                         Ok(frame) => {
                                             if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
+                                                // 缓冲事件（复�?StreamContext 的处理逻辑�?
                                                 ctx.process_and_buffer(&event);
                                             }
                                         }
@@ -1430,11 +1430,11 @@ fn create_buffered_sse_stream(
                                         }
                                     }
                                 }
-                                // 继续读取下一个 chunk，不发送任何数据
+                                // 继续读取下一�?chunk，不发送任何数�?
                             }
                             Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
+                                tracing::error!("读取响应流失�? {}", e);
+                                // 发生错误，完成处理并返回所有事�?
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
@@ -1443,8 +1443,8 @@ fn create_buffered_sse_stream(
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
                             }
                             None => {
-                                // 流结束。先检测上游空响应（与流式路径一致），
-                                // 若空则补发 error 事件（大输入提示压缩上下文，小输入可重试）。
+                                // 流结束。先检测上游空响应（与流式路径一致）�?
+                                // 若空则补�?error 事件（大输入提示压缩上下文，小输入可重试）�?
                                 if ctx.is_empty_response() {
                                     let oversized = ctx.empty_response_is_oversized_context();
                                     tracing::warn!(
@@ -1455,7 +1455,7 @@ fn create_buffered_sse_stream(
                                     let bytes = vec![Ok(Bytes::from(err_event.to_sse_string()))];
                                     return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
                                 }
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）
+                                // 流结束，完成处理并返回所有事件（已更�?input_tokens�?
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
