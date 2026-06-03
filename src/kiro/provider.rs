@@ -29,18 +29,39 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
-/// 最大并发请求数默认值（同时发往上游的请求上限）
-/// 可通过环境变量 KIRO_MAX_CONCURRENT 覆盖。单账号场景下默认走保守值，
-/// 减少瞬时并发撑爆单个 Kiro 账号。
-const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 6;
+/// 每账号干净并发默认值（不撞上游限流的安全值）。
+/// 实测（2026-06-03 阶梯压测）单 Kiro 账号在并发 6 时已 ~45% 成功率（开始大量 429），
+/// 故每账号取保守的 5：低于撞墙拐点，给负载均衡摊不匀留余量。
+/// 可通过环境变量 KIRO_CONCURRENT_PER_ACCOUNT 覆盖。
+const DEFAULT_CONCURRENT_PER_ACCOUNT: usize = 5;
 
-/// 读取有效并发上限：优先环境变量 KIRO_MAX_CONCURRENT，非法/缺失时回退默认值
-fn effective_max_concurrent() -> usize {
-    std::env::var("KIRO_MAX_CONCURRENT")
+/// 读取“每账号并发”：优先环境变量 KIRO_CONCURRENT_PER_ACCOUNT，非法/缺失时回退默认值
+fn concurrent_per_account() -> usize {
+    std::env::var("KIRO_CONCURRENT_PER_ACCOUNT")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
+        .unwrap_or(DEFAULT_CONCURRENT_PER_ACCOUNT)
+}
+
+/// 计算有效全局并发上限：
+/// 1. 若设置了 KIRO_MAX_CONCURRENT（绝对值，逃生口）→ 直接采用，跳过账号数计算
+/// 2. 否则 = 每账号并发 × 可用账号数（随热加/禁用账号在重建后自动跟随）
+///
+/// 注意：这是“启动/重建时”计算的静态值；运行时热加账号不会即时扩容信号量，
+/// 需重建容器才生效（见 LESSONS）。account_count 传入 available_count()（非禁用账号数）。
+fn effective_max_concurrent(account_count: usize) -> usize {
+    // 绝对值逃生口优先：压测/排障时可强制指定，忽略账号数
+    if let Some(abs) = std::env::var("KIRO_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+    {
+        return abs;
+    }
+    let per = concurrent_per_account();
+    let n = account_count.max(1); // 至少按 1 个账号算，避免空账号时上限为 0
+    per.saturating_mul(n).max(1)
 }
 
 /// 并发快照：metrics 端点与结构化日志共用的真实并发度读数
@@ -135,8 +156,14 @@ impl KiroProvider {
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
-        let max_concurrent = effective_max_concurrent();
-        tracing::info!("并发上限 KIRO_MAX_CONCURRENT = {}（排队模式，超额请求等待名额）", max_concurrent);
+        let account_count = token_manager.available_count();
+        let max_concurrent = effective_max_concurrent(account_count);
+        tracing::info!(
+            "并发上限 = {}（账号数={}，排队模式，超额请求等待名额；\
+             绝对值覆盖 KIRO_MAX_CONCURRENT / 每账号 KIRO_CONCURRENT_PER_ACCOUNT）",
+            max_concurrent,
+            account_count
+        );
 
         Self {
             token_manager,
@@ -892,6 +919,44 @@ mod tests {
     fn create_test_provider(config: Config, credentials: KiroCredentials) -> KiroProvider {
         let tm = MultiTokenManager::new(config, vec![credentials], None, None, false).unwrap();
         KiroProvider::new(Arc::new(tm))
+    }
+
+    /// 并发上限计算：绝对值逃生口 + 每账号×账号数。
+    /// 集中在一个测试里顺序跑，避免并行测试污染全局 env。
+    #[test]
+    fn test_effective_max_concurrent() {
+        // 清理环境，从默认值开始
+        unsafe {
+            std::env::remove_var("KIRO_MAX_CONCURRENT");
+            std::env::remove_var("KIRO_CONCURRENT_PER_ACCOUNT");
+        }
+        // 默认：每账号 5 × 账号数
+        assert_eq!(effective_max_concurrent(1), 5);
+        assert_eq!(effective_max_concurrent(3), 15);
+        // 0 账号按 1 算，不为 0
+        assert_eq!(effective_max_concurrent(0), 5);
+
+        // 每账号覆盖
+        unsafe { std::env::set_var("KIRO_CONCURRENT_PER_ACCOUNT", "4"); }
+        assert_eq!(effective_max_concurrent(1), 4);
+        assert_eq!(effective_max_concurrent(2), 8);
+
+        // 绝对值逃生口优先，忽略账号数与 per-account
+        unsafe { std::env::set_var("KIRO_MAX_CONCURRENT", "6"); }
+        assert_eq!(effective_max_concurrent(10), 6);
+        assert_eq!(effective_max_concurrent(1), 6);
+
+        // 非法绝对值回退到 per-account×n
+        unsafe { std::env::set_var("KIRO_MAX_CONCURRENT", "0"); }
+        assert_eq!(effective_max_concurrent(2), 8); // per=4, n=2
+        unsafe { std::env::set_var("KIRO_MAX_CONCURRENT", "abc"); }
+        assert_eq!(effective_max_concurrent(2), 8);
+
+        // 清理，避免影响其他测试
+        unsafe {
+            std::env::remove_var("KIRO_MAX_CONCURRENT");
+            std::env::remove_var("KIRO_CONCURRENT_PER_ACCOUNT");
+        }
     }
 
     #[test]
