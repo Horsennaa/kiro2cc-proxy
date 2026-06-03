@@ -25,5 +25,11 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
 
+      - name: Stub frontend dist (rust-embed needs folders to exist for Asset::get)
+        run: |
+          mkdir -p admin-ui/dist user-ui/dist
+          echo '<!doctype html><title>stub</title>' > admin-ui/dist/index.html
+          echo '<!doctype html><title>stub</title>' > user-ui/dist/index.html
+
       - name: Run tests
         run: cargo test --bins --release -- --nocapture
