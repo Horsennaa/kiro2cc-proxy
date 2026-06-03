@@ -26,4 +26,4 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test --lib --release -- --nocapture
+        run: cargo test --bins --release -- --nocapture
