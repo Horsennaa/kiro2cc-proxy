@@ -44,6 +44,24 @@ fn concurrent_per_account() -> usize {
         .unwrap_or(DEFAULT_CONCURRENT_PER_ACCOUNT)
 }
 
+/// 首字节超时默认值（秒）。
+/// 背景：build_client 的 reqwest .timeout() 是“总请求超时”（含整段响应流），硬编码 180s，
+/// 无法区分“上游迟迟不吐第一个字节（卡死）”与“正常长流式响应”。实测上游偶发首字节延迟
+/// 尖峰（frt 32s+）会让客户端 agent 干等到放弃（client_gone），表现为“调用无反应”。
+/// 这里给主流式路径的 .send()（在响应头到达时 resolve，先于 body 流）单独加一层首字节超时，
+/// 超时即视为本次尝试的瞬态失败，走既有重试/切账号逻辑，而不会误杀已经开始的长响应流。
+const DEFAULT_FIRST_BYTE_TIMEOUT_SECS: u64 = 32;
+
+/// 读取“首字节超时（秒）”：优先环境变量 KIRO_FIRST_BYTE_TIMEOUT_SECS。
+/// 设为 0 表示禁用首字节超时（仅保留 build_client 的 180s 总超时）。
+/// 非法/缺失时回退默认值。
+fn first_byte_timeout_secs() -> u64 {
+    std::env::var("KIRO_FIRST_BYTE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT_SECS)
+}
+
 /// 计算有效全局并发上限：
 /// 1. 若设置了 KIRO_MAX_CONCURRENT（绝对值，逃生口）→ 直接采用，跳过账号数计算
 /// 2. 否则 = 每账号并发 × 可用账号数（随热加/禁用账号在重建后自动跟随）
@@ -647,14 +665,38 @@ impl KiroProvider {
                 }
             };
 
-            // 发送请求
-            let response = match self
+            // 发送请求（首字节超时保护：仅 .send() 阶段，不影响后续 body 流式读取）
+            let fb_timeout = first_byte_timeout_secs();
+            let send_fut = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .headers(headers)
                 .body(request_body.to_string())
-                .send()
-                .await
+                .send();
+            let send_result = if fb_timeout > 0 {
+                match tokio::time::timeout(Duration::from_secs(fb_timeout), send_fut).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tracing::warn!(
+                            "API 首字节超时（{}s 内上游未返回响应头，尝试 {}/{}），按瞬态网络错误重试",
+                            fb_timeout,
+                            attempt + 1,
+                            max_retries
+                        );
+                        last_error = Some(anyhow::anyhow!(
+                            "上游首字节超时：{}s 内未返回响应头",
+                            fb_timeout
+                        ));
+                        if attempt + 1 < max_retries {
+                            sleep(Self::retry_delay(attempt)).await;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                send_fut.await
+            };
+            let response = match send_result
             {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -957,6 +999,24 @@ mod tests {
             std::env::remove_var("KIRO_MAX_CONCURRENT");
             std::env::remove_var("KIRO_CONCURRENT_PER_ACCOUNT");
         }
+    }
+
+    /// 首字节超时读取：默认 32 / env 覆盖 / 0 禁用 / 非法回退。
+    #[test]
+    fn test_first_byte_timeout_secs() {
+        unsafe { std::env::remove_var("KIRO_FIRST_BYTE_TIMEOUT_SECS"); }
+        assert_eq!(first_byte_timeout_secs(), 32); // 默认
+
+        unsafe { std::env::set_var("KIRO_FIRST_BYTE_TIMEOUT_SECS", "45"); }
+        assert_eq!(first_byte_timeout_secs(), 45); // env 覆盖
+
+        unsafe { std::env::set_var("KIRO_FIRST_BYTE_TIMEOUT_SECS", "0"); }
+        assert_eq!(first_byte_timeout_secs(), 0); // 0 = 禁用首字节超时
+
+        unsafe { std::env::set_var("KIRO_FIRST_BYTE_TIMEOUT_SECS", "abc"); }
+        assert_eq!(first_byte_timeout_secs(), 32); // 非法回退默认
+
+        unsafe { std::env::remove_var("KIRO_FIRST_BYTE_TIMEOUT_SECS"); }
     }
 
     #[test]
