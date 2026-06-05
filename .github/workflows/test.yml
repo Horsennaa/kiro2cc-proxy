@@ -1,0 +1,35 @@
+name: Rust Tests
+
+on:
+  push:
+    branches:
+      - v2.2.23-gw-fix2
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
+
+      - name: Stub frontend dist (rust-embed needs folders to exist for Asset::get)
+        run: |
+          mkdir -p admin-ui/dist user-ui/dist
+          echo '<!doctype html><title>stub</title>' > admin-ui/dist/index.html
+          echo '<!doctype html><title>stub</title>' > user-ui/dist/index.html
+
+      - name: Run tests
+        run: cargo test --bins --release -- --nocapture

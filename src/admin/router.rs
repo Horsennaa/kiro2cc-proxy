@@ -14,9 +14,9 @@ use super::{
     },
     handlers::{
         add_credential, delete_credential, get_all_credentials, get_auth_keys,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count,
-        set_auth_keys, set_credential_disabled, set_credential_priority,
-        set_load_balancing_mode, update_credential,
+        get_concurrency_config, get_credential_balance, get_load_balancing_mode, get_metrics,
+        reset_failure_count, set_auth_keys, set_concurrency_config, set_credential_disabled,
+        set_credential_priority, set_load_balancing_mode, update_credential,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -43,6 +43,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/auth-keys",
             get(get_auth_keys).put(set_auth_keys),
         )
+        .route(
+            "/config/concurrency",
+            get(get_concurrency_config).put(set_concurrency_config),
+        )
         // API Key 管理
         .route("/server-info", get(get_server_info))
         .route("/api-keys", get(list_api_keys).post(create_api_key))
@@ -52,6 +56,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/api-keys/{id}/usage/records", get(get_key_usage_records))
         // RPM 监控
         .route("/rpm", get(get_rpm))
+        // 并发监控（信号量 in_use / waiting）
+        .route("/metrics", get(get_metrics))
         .route("/usage/daily", get(get_daily_usage))
         .route("/usage/daily/{date}/records", get(get_daily_usage_records))
         .layer(middleware::from_fn_with_state(

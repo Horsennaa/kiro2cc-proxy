@@ -390,3 +390,31 @@ pub struct SetAuthKeysRequest {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 }
+
+// ============ 并发配置管理 ============
+
+/// 并发配置查询响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcurrencyConfigResponse {
+    /// 当前每账号并发值
+    pub per_account: usize,
+    /// 当前全局并发上限（= 信号量 permit 总数）
+    pub max_concurrent: usize,
+    /// 当前可用（非禁用）账号数
+    pub account_count: usize,
+    /// 当前在飞请求数
+    pub in_use: usize,
+    /// 当前排队等待数
+    pub waiting: usize,
+    /// 是否被 KIRO_MAX_CONCURRENT 绝对值锁定（锁定时改 perAccount 无效）
+    pub absolute_lock: bool,
+}
+
+/// 修改并发配置请求（运行时热改，无需重启）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConcurrencyConfigRequest {
+    /// 新的每账号并发值（必填，>=1）。生效上限 = perAccount × 可用账号数。
+    pub per_account: usize,
+}

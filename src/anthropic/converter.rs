@@ -439,7 +439,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let chat_trigger_type = determine_chat_trigger_type(req);
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
-    let last_message = messages.last().unwrap();
+    let last_message = messages.last().ok_or(ConversionError::EmptyMessages)?;
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
     let text_content = append_recent_knowledge_hints(text_content);
     let text_content = append_output_format_instruction(text_content, &req.output_config);
