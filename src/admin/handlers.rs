@@ -10,7 +10,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
+        AddCredentialRequest, ConcurrencyConfigResponse, SetConcurrencyConfigRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
         SuccessResponse, UpdateCredentialRequest,
     },
 };
@@ -240,6 +241,85 @@ pub async fn get_metrics(State(state): State<AdminState>) -> impl IntoResponse {
                 "saturated": snap.in_use >= snap.max,
             }))
             .into_response()
+        }
+        None => {
+            let error = super::types::AdminErrorResponse::internal_error("并发监控未启用");
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!(error)),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /api/admin/config/concurrency
+/// 查当前并发配置（每账号值 / 生效上限 / 账号数 / 在飞 / 排队 / 是否绝对值锁定）。
+pub async fn get_concurrency_config(State(state): State<AdminState>) -> impl IntoResponse {
+    match &state.concurrency_monitor {
+        Some(monitor) => {
+            let snap = monitor.snapshot();
+            Json(ConcurrencyConfigResponse {
+                per_account: monitor.per_account(),
+                max_concurrent: snap.max,
+                account_count: state.service.available_count(),
+                in_use: snap.in_use,
+                waiting: snap.waiting,
+                absolute_lock: monitor.is_absolute_lock(),
+            })
+            .into_response()
+        }
+        None => {
+            let error = super::types::AdminErrorResponse::internal_error("并发监控未启用");
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!(error)),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// PUT /api/admin/config/concurrency
+/// 运行时热改每账号并发值（无需重启）。生效上限 = perAccount × 可用账号数。
+/// 扩容立即生效；缩容不打断在飞请求，随名额释放收敛。
+pub async fn set_concurrency_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetConcurrencyConfigRequest>,
+) -> impl IntoResponse {
+    if payload.per_account < 1 {
+        let error = super::types::AdminErrorResponse::invalid_request("perAccount 必须 >= 1");
+        return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!(error))).into_response();
+    }
+    match &state.concurrency_monitor {
+        Some(monitor) => {
+            let account_count = state.service.available_count();
+            match monitor.set_per_account(payload.per_account, account_count) {
+                Ok((old_max, new_max)) => {
+                    tracing::info!(
+                        evt = "concurrency_hot_reload",
+                        per_account = payload.per_account,
+                        account_count,
+                        old_max,
+                        new_max,
+                        "并发上限热改（无重启）"
+                    );
+                    let snap = monitor.snapshot();
+                    Json(ConcurrencyConfigResponse {
+                        per_account: monitor.per_account(),
+                        max_concurrent: snap.max,
+                        account_count,
+                        in_use: snap.in_use,
+                        waiting: snap.waiting,
+                        absolute_lock: monitor.is_absolute_lock(),
+                    })
+                    .into_response()
+                }
+                Err(e) => {
+                    let error = super::types::AdminErrorResponse::invalid_request(e.to_string());
+                    (axum::http::StatusCode::CONFLICT, Json(serde_json::json!(error))).into_response()
+                }
+            }
         }
         None => {
             let error = super::types::AdminErrorResponse::internal_error("并发监控未启用");

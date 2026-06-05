@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::provider::ConcurrencyMonitor;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
@@ -38,6 +39,8 @@ pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
+    /// 并发控制句柄（可选）：热加/删除账号后重算并发上限，无需重启
+    concurrency_monitor: Option<ConcurrencyMonitor>,
 }
 
 impl AdminService {
@@ -52,6 +55,31 @@ impl AdminService {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
+            concurrency_monitor: None,
+        }
+    }
+
+    /// 注入并发控制句柄，使热加/删除账号后并发上限随账号数自动伸缩
+    pub fn with_concurrency_monitor(mut self, monitor: ConcurrencyMonitor) -> Self {
+        self.concurrency_monitor = Some(monitor);
+        self
+    }
+
+    /// 按当前可用账号数重算并发上限（热加/删除账号后调用）
+    fn rescale_concurrency(&self, reason: &str) {
+        if let Some(monitor) = &self.concurrency_monitor {
+            let account_count = self.token_manager.available_count();
+            let (old_max, new_max) = monitor.recompute_for_accounts(account_count);
+            if old_max != new_max {
+                tracing::info!(
+                    evt = "concurrency_rescale",
+                    reason,
+                    account_count,
+                    old_max,
+                    new_max,
+                    "并发上限随账号数变化自动伸缩（无重启）"
+                );
+            }
         }
     }
 
@@ -108,6 +136,8 @@ impl AdminService {
         if disabled && id == current_id {
             let _ = self.token_manager.switch_to_next();
         }
+        // 禁用/启用改变可用账号数，重算并发上限（热生效）
+        self.rescale_concurrency("set_disabled");
         Ok(())
     }
 
@@ -122,7 +152,10 @@ impl AdminService {
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
             .reset_and_enable(id)
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        // 重新启用可能增加可用账号数，重算并发上限（热生效）
+        self.rescale_concurrency("reset_and_enable");
+        Ok(())
     }
 
     /// 获取账号余额（带缓存）
@@ -231,6 +264,9 @@ impl AdminService {
             }
         });
 
+        // 账号数 +1，重算并发上限（热生效，无需重启）
+        self.rescale_concurrency("add_credential");
+
         Ok(AddCredentialResponse {
             success: true,
             message: format!("账号添加成功，ID: {}", credential_id),
@@ -251,6 +287,9 @@ impl AdminService {
             cache.remove(&id);
         }
         self.save_balance_cache();
+
+        // 账号数 -1，重算并发上限（热生效，不打断在飞请求）
+        self.rescale_concurrency("delete_credential");
 
         Ok(())
     }
@@ -286,6 +325,11 @@ impl AdminService {
                 .unwrap_or_else(|| format!("#{}", e.id));
             (e.id, label)
         }).collect()
+    }
+
+    /// 当前可用（非禁用）账号数，用于并发上限重算
+    pub fn available_count(&self) -> usize {
+        self.token_manager.available_count()
     }
 
     /// 获取负载均衡模式

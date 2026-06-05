@@ -173,7 +173,10 @@ async fn refresh_social_token(
 ) -> anyhow::Result<KiroCredentials> {
     tracing::info!("正在刷新 Social Token...");
 
-    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let refresh_token = credentials
+        .refresh_token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Social 刷新需要 refreshToken（凭据缺失该字段）"))?;
     // 优先级：账号.auth_region > 账号.region > config.auth_region > config.region
     let region = credentials.effective_auth_region(config);
 
@@ -268,7 +271,10 @@ async fn refresh_idc_token(
 ) -> anyhow::Result<KiroCredentials> {
     tracing::info!("正在刷新 IdC Token...");
 
-    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let refresh_token = credentials
+        .refresh_token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("IdC 刷新需要 refreshToken（凭据缺失该字段）"))?;
     let client_id = credentials
         .client_id
         .as_ref()

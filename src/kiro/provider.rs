@@ -29,10 +29,10 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
-/// 每账号干净并发默认值（不撞上游限流的安全值）。
+/// 每账号并发默认值（不撞上游限流的安全值）。
 /// 实测（2026-06-03 阶梯压测）单 Kiro 账号在并发 6 时已 ~45% 成功率（开始大量 429），
 /// 故每账号取保守的 5：低于撞墙拐点，给负载均衡摊不匀留余量。
-/// 可通过环境变量 KIRO_CONCURRENT_PER_ACCOUNT 覆盖。
+/// 启动时可通过环境变量 KIRO_CONCURRENT_PER_ACCOUNT 覆盖；运行时可通过 admin API 热改。
 const DEFAULT_CONCURRENT_PER_ACCOUNT: usize = 5;
 
 /// 读取“每账号并发”：优先环境变量 KIRO_CONCURRENT_PER_ACCOUNT，非法/缺失时回退默认值
@@ -62,24 +62,23 @@ fn first_byte_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT_SECS)
 }
 
-/// 计算有效全局并发上限：
-/// 1. 若设置了 KIRO_MAX_CONCURRENT（绝对值，逃生口）→ 直接采用，跳过账号数计算
-/// 2. 否则 = 每账号并发 × 可用账号数（随热加/禁用账号在重建后自动跟随）
+/// 计算初始并发配置，返回 (max, absolute_lock, per_account)：
+/// 1. 若设置了 KIRO_MAX_CONCURRENT（绝对值，逃生口）→ 直接采用，锁定不随账号数/热改变化
+/// 2. 否则 max = 每账号并发 × 可用账号数；运行时可随热加账号或 admin 改每账号值而 resize
 ///
-/// 注意：这是“启动/重建时”计算的静态值；运行时热加账号不会即时扩容信号量，
-/// 需重建容器才生效（见 LESSONS）。account_count 传入 available_count()（非禁用账号数）。
-fn effective_max_concurrent(account_count: usize) -> usize {
-    // 绝对值逃生口优先：压测/排障时可强制指定，忽略账号数
+/// account_count 传入 available_count()（非禁用账号数）。
+fn initial_concurrency_config(account_count: usize) -> (usize, bool, usize) {
+    let per = concurrent_per_account();
+    // 绝对值逃生口优先：压测/排障时可强制指定，忽略账号数，且锁定不可热改
     if let Some(abs) = std::env::var("KIRO_MAX_CONCURRENT")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n >= 1)
     {
-        return abs;
+        return (abs, true, per);
     }
-    let per = concurrent_per_account();
     let n = account_count.max(1); // 至少按 1 个账号算，避免空账号时上限为 0
-    per.saturating_mul(n).max(1)
+    (per.saturating_mul(n).max(1), false, per)
 }
 
 /// 并发快照：metrics 端点与结构化日志共用的真实并发度读数
@@ -95,26 +94,144 @@ pub struct ConcurrencySnapshot {
     pub available: usize,
 }
 
+/// 并发控制器：集中管理信号量 + 运行时可改的上限。
+/// 所有读写均走该结构（共享 Arc），保证 provider 热路径与 admin 热改看到同一份状态。
+///
+/// resize 语义：
+/// - 扩容：`add_permits(delta)`，立即生效，排队中的请求马上拿到新名额。
+/// - 缩容：`forget_permits(delta)`，仅抑制未来发放，**不打断在飞请求**；
+///   若当前 available 不足，剩余负值会随在飞请求陆续释放时被吸收，最终收敛到新上限。
+pub struct ConcurrencyController {
+    /// 并发控制信号量，限制同时发往上游的请求数
+    semaphore: Arc<Semaphore>,
+    /// 当前并发上限（= 信号量逻辑 permit 总数，运行时可变）
+    max: AtomicUsize,
+    /// 在信号量门口排队等待名额的请求数（自维护计数器，tokio 不原生暴露）
+    waiting: Arc<AtomicUsize>,
+    /// 每账号并发值（运行时可改；仅在未设 KIRO_MAX_CONCURRENT 绝对值时生效）
+    per_account: AtomicUsize,
+    /// 是否走绝对值锁定（KIRO_MAX_CONCURRENT 设置后，per_account 不再影响上限）
+    absolute_lock: bool,
+}
+
+impl ConcurrencyController {
+    /// 创建控制器。`per_account` 为启动时读取的每账号值，`absolute_lock` 表示是否由 KIRO_MAX_CONCURRENT 锁定。
+    fn new(initial_max: usize, per_account: usize, absolute_lock: bool) -> Arc<Self> {
+        Arc::new(Self {
+            semaphore: Arc::new(Semaphore::new(initial_max)),
+            max: AtomicUsize::new(initial_max),
+            waiting: Arc::new(AtomicUsize::new(0)),
+            per_account: AtomicUsize::new(per_account.max(1)),
+            absolute_lock,
+        })
+    }
+
+    /// 读当前并发上限
+    pub fn max(&self) -> usize {
+        self.max.load(Ordering::Relaxed)
+    }
+
+    /// 读当前每账号并发值
+    pub fn per_account(&self) -> usize {
+        self.per_account.load(Ordering::Relaxed)
+    }
+
+    /// 是否被绝对值锁定（锁定时改 per_account 不会调整上限）
+    pub fn is_absolute_lock(&self) -> bool {
+        self.absolute_lock
+    }
+
+    /// 读当前并发快照（瞬时值）
+    pub fn snapshot(&self) -> ConcurrencySnapshot {
+        let max = self.max.load(Ordering::Relaxed);
+        let available = self.semaphore.available_permits();
+        ConcurrencySnapshot {
+            max,
+            in_use: max.saturating_sub(available),
+            waiting: self.waiting.load(Ordering::Relaxed),
+            available,
+        }
+    }
+
+    /// 申请名额（cancel-safe）：进入等待前 +1 排队计数，拿到名额（或被取消）后由 guard 自动 -1。
+    async fn acquire(&self) -> anyhow::Result<OwnedSemaphorePermit> {
+        let guard = WaitingGuard::new(self.waiting.clone());
+        let permit = self.semaphore.clone().acquire_owned().await?;
+        drop(guard);
+        Ok(permit)
+    }
+
+    /// 将并发上限调整为 `new_max`（扩容立即生效，缩容不打断在飞请求）。
+    /// 返回 (old_max, new_max)。new_max 底为 1。
+    fn resize_to(&self, new_max: usize) -> (usize, usize) {
+        let new_max = new_max.max(1);
+        let old_max = self.max.swap(new_max, Ordering::SeqCst);
+        if new_max > old_max {
+            self.semaphore.add_permits(new_max - old_max);
+        } else if new_max < old_max {
+            // forget_permits 只能回收当前 available 的部分；超出部分随在飞请求释放时被
+            // “欠账”吸收（max 已下调，in_use 可能短暂 > max，快照会 saturating 到 0）。
+            self.semaphore.forget_permits(old_max - new_max);
+        }
+        (old_max, new_max)
+    }
+
+    /// 重算并应用“按账号数 × 每账号”的上限（绝对值锁定时为 no-op）。
+    /// `account_count` 传入当前可用账号数。返回 (old_max, new_max)。
+    pub fn recompute_for_accounts(&self, account_count: usize) -> (usize, usize) {
+        if self.absolute_lock {
+            let m = self.max.load(Ordering::Relaxed);
+            return (m, m);
+        }
+        let per = self.per_account.load(Ordering::Relaxed).max(1);
+        let n = account_count.max(1);
+        self.resize_to(per.saturating_mul(n))
+    }
+
+    /// 设置每账号并发值并立即按当前账号数 resize（运行时热改入口）。
+    /// 绝对值锁定时返回 Err。返回 (old_max, new_max)。
+    pub fn set_per_account(&self, per_account: usize, account_count: usize) -> anyhow::Result<(usize, usize)> {
+        if self.absolute_lock {
+            anyhow::bail!("当前由 KIRO_MAX_CONCURRENT 绝对值锁定，改每账号值无效；请先移除该环境变量");
+        }
+        let per = per_account.max(1);
+        self.per_account.store(per, Ordering::Relaxed);
+        Ok(self.recompute_for_accounts(account_count))
+    }
+}
+
 /// 并发监控句柄：可克隆，供 admin /metrics 端点读取实时并发度。
-/// 数据源与 provider 内部信号量完全一致（共享 Arc）。
+/// 数据源与 provider 内部信号量完全一致（共享 Arc<ConcurrencyController>）。
 #[derive(Clone)]
 pub struct ConcurrencyMonitor {
-    semaphore: Arc<Semaphore>,
-    waiting: Arc<AtomicUsize>,
-    max: usize,
+    controller: Arc<ConcurrencyController>,
 }
 
 impl ConcurrencyMonitor {
     /// 读取当前并发快照（瞬时值）
     pub fn snapshot(&self) -> ConcurrencySnapshot {
-        let available = self.semaphore.available_permits();
-        let in_use = self.max.saturating_sub(available);
-        ConcurrencySnapshot {
-            max: self.max,
-            in_use,
-            waiting: self.waiting.load(Ordering::Relaxed),
-            available,
-        }
+        self.controller.snapshot()
+    }
+
+    /// 设置每账号并发值并立即 resize（运行时热改，无需重启）。
+    /// 返回 (old_max, new_max)；绝对值锁定时返回 Err。
+    pub fn set_per_account(&self, per_account: usize, account_count: usize) -> anyhow::Result<(usize, usize)> {
+        self.controller.set_per_account(per_account, account_count)
+    }
+
+    /// 按当前账号数重算上限（热加/禁用账号后调用，即时跟随）。
+    pub fn recompute_for_accounts(&self, account_count: usize) -> (usize, usize) {
+        self.controller.recompute_for_accounts(account_count)
+    }
+
+    /// 当前每账号并发值
+    pub fn per_account(&self) -> usize {
+        self.controller.per_account()
+    }
+
+    /// 是否被 KIRO_MAX_CONCURRENT 绝对值锁定
+    pub fn is_absolute_lock(&self) -> bool {
+        self.controller.is_absolute_lock()
     }
 }
 
@@ -148,12 +265,8 @@ pub struct KiroProvider {
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
-    /// 并发控制信号量，限制同时发往上游的请求数
-    concurrency_limit: Arc<Semaphore>,
-    /// 并发上限快照值（= 信号量初始 permit 数，用于计算 in_use）
-    concurrency_max: usize,
-    /// 在信号量门口排队等待名额的请求数（自维护计数器，tokio 不原生暴露）
-    concurrency_waiting: Arc<AtomicUsize>,
+    /// 并发控制器（信号量 + 运行时可改上限 + 排队计数，共享 Arc）
+    concurrency: Arc<ConcurrencyController>,
     /// RPM 追踪器（可选，用于记录账号维度的 RPM）
     rpm_tracker: Option<Arc<RpmTracker>>,
 }
@@ -175,12 +288,14 @@ impl KiroProvider {
         cache.insert(proxy.clone(), initial_client);
 
         let account_count = token_manager.available_count();
-        let max_concurrent = effective_max_concurrent(account_count);
+        let (max_concurrent, absolute_lock, per_account) = initial_concurrency_config(account_count);
         tracing::info!(
-            "并发上限 = {}（账号数={}，排队模式，超额请求等待名额；\
-             绝对值覆盖 KIRO_MAX_CONCURRENT / 每账号 KIRO_CONCURRENT_PER_ACCOUNT）",
+            "并发上限 = {}（账号数={}，每账号={}，锁定={}，排队模式，超额请求等待名额；\
+             绝对值覆盖 KIRO_MAX_CONCURRENT / 每账号 KIRO_CONCURRENT_PER_ACCOUNT，辐可经 admin API 热改）",
             max_concurrent,
-            account_count
+            account_count,
+            per_account,
+            absolute_lock
         );
 
         Self {
@@ -188,9 +303,7 @@ impl KiroProvider {
             global_proxy: proxy,
             client_cache: Mutex::new(cache),
             tls_backend,
-            concurrency_limit: Arc::new(Semaphore::new(max_concurrent)),
-            concurrency_max: max_concurrent,
-            concurrency_waiting: Arc::new(AtomicUsize::new(0)),
+            concurrency: ConcurrencyController::new(max_concurrent, per_account, absolute_lock),
             rpm_tracker: None,
         }
     }
@@ -201,33 +314,22 @@ impl KiroProvider {
         self
     }
 
-    /// 获取并发监控句柄（可克隆，供 admin /metrics 端点读取实时并发度）
+    /// 获取并发监控句柄（可克隆，供 admin /metrics 与 热改端点共享同一控制器）
     pub fn concurrency_monitor(&self) -> ConcurrencyMonitor {
         ConcurrencyMonitor {
-            semaphore: self.concurrency_limit.clone(),
-            waiting: self.concurrency_waiting.clone(),
-            max: self.concurrency_max,
+            controller: self.concurrency.clone(),
         }
     }
 
     /// 读取当前并发快照（瞬时值），用于结构化日志注入
     fn concurrency_snapshot(&self) -> ConcurrencySnapshot {
-        let available = self.concurrency_limit.available_permits();
-        ConcurrencySnapshot {
-            max: self.concurrency_max,
-            in_use: self.concurrency_max.saturating_sub(available),
-            waiting: self.concurrency_waiting.load(Ordering::Relaxed),
-            available,
-        }
+        self.concurrency.snapshot()
     }
 
     /// 申请并发名额：进入等待前 +1 排队计数，拿到名额（或被取消）后由 guard 自动 -1。
-    /// 集中在此处理排队埋点，两个调用点共用，cancel-safe。
+    /// 集中在 controller 处理排队埋点，两个调用点共用，cancel-safe。
     async fn acquire_permit(&self) -> anyhow::Result<OwnedSemaphorePermit> {
-        let guard = WaitingGuard::new(self.concurrency_waiting.clone());
-        let permit = self.concurrency_limit.clone().acquire_owned().await?;
-        drop(guard);
-        Ok(permit)
+        self.concurrency.acquire().await
     }
 
     /// 根据账号的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -966,39 +1068,80 @@ mod tests {
     /// 并发上限计算：绝对值逃生口 + 每账号×账号数。
     /// 集中在一个测试里顺序跑，避免并行测试污染全局 env。
     #[test]
-    fn test_effective_max_concurrent() {
+    fn test_initial_concurrency_config() {
         // 清理环境，从默认值开始
         unsafe {
             std::env::remove_var("KIRO_MAX_CONCURRENT");
             std::env::remove_var("KIRO_CONCURRENT_PER_ACCOUNT");
         }
-        // 默认：每账号 5 × 账号数
-        assert_eq!(effective_max_concurrent(1), 5);
-        assert_eq!(effective_max_concurrent(3), 15);
+        // 默认：每账号 5 × 账号数，不锁定
+        assert_eq!(initial_concurrency_config(1), (5, false, 5));
+        assert_eq!(initial_concurrency_config(3), (15, false, 5));
         // 0 账号按 1 算，不为 0
-        assert_eq!(effective_max_concurrent(0), 5);
+        assert_eq!(initial_concurrency_config(0), (5, false, 5));
 
         // 每账号覆盖
         unsafe { std::env::set_var("KIRO_CONCURRENT_PER_ACCOUNT", "4"); }
-        assert_eq!(effective_max_concurrent(1), 4);
-        assert_eq!(effective_max_concurrent(2), 8);
+        assert_eq!(initial_concurrency_config(1), (4, false, 4));
+        assert_eq!(initial_concurrency_config(2), (8, false, 4));
 
-        // 绝对值逃生口优先，忽略账号数与 per-account
+        // 绝对值逃生口优先，锁定=true，忽略账号数
         unsafe { std::env::set_var("KIRO_MAX_CONCURRENT", "6"); }
-        assert_eq!(effective_max_concurrent(10), 6);
-        assert_eq!(effective_max_concurrent(1), 6);
+        assert_eq!(initial_concurrency_config(10), (6, true, 4));
+        assert_eq!(initial_concurrency_config(1), (6, true, 4));
 
-        // 非法绝对值回退到 per-account×n
+        // 非法绝对值回退到 per-account×n，不锁定
         unsafe { std::env::set_var("KIRO_MAX_CONCURRENT", "0"); }
-        assert_eq!(effective_max_concurrent(2), 8); // per=4, n=2
+        assert_eq!(initial_concurrency_config(2), (8, false, 4)); // per=4, n=2
         unsafe { std::env::set_var("KIRO_MAX_CONCURRENT", "abc"); }
-        assert_eq!(effective_max_concurrent(2), 8);
+        assert_eq!(initial_concurrency_config(2), (8, false, 4));
 
         // 清理，避免影响其他测试
         unsafe {
             std::env::remove_var("KIRO_MAX_CONCURRENT");
             std::env::remove_var("KIRO_CONCURRENT_PER_ACCOUNT");
         }
+    }
+
+    /// 运行时 resize：扩容立即生效，缩容不负值，热改每账号值按账号数重算。
+    #[test]
+    fn test_concurrency_controller_resize() {
+        // 初始：每账号 5，2 个账号 = 10，不锁定
+        let ctrl = ConcurrencyController::new(10, 5, false);
+        assert_eq!(ctrl.max(), 10);
+        assert_eq!(ctrl.per_account(), 5);
+        assert_eq!(ctrl.snapshot().available, 10);
+
+        // 热加一个账号（3 个）→ 上限 15，扩容立即生效
+        let (old, new) = ctrl.recompute_for_accounts(3);
+        assert_eq!((old, new), (10, 15));
+        assert_eq!(ctrl.max(), 15);
+        assert_eq!(ctrl.snapshot().available, 15);
+
+        // 热改每账号值为 8（3 个账号）→ 上限 24
+        let (old, new) = ctrl.set_per_account(8, 3).expect("未锁定应成功");
+        assert_eq!((old, new), (15, 24));
+        assert_eq!(ctrl.max(), 24);
+        assert_eq!(ctrl.per_account(), 8);
+
+        // 缩容：账号减到 1 → 上限 8（全部空闲，可立即回收）
+        let (old, new) = ctrl.recompute_for_accounts(1);
+        assert_eq!((old, new), (24, 8));
+        assert_eq!(ctrl.max(), 8);
+        assert_eq!(ctrl.snapshot().available, 8);
+    }
+
+    /// 绝对值锁定时：recompute 为 no-op，set_per_account 返回 Err。
+    #[test]
+    fn test_concurrency_controller_absolute_lock() {
+        let ctrl = ConcurrencyController::new(6, 5, true);
+        assert_eq!(ctrl.max(), 6);
+        // 账号数变化不影响上限
+        assert_eq!(ctrl.recompute_for_accounts(100), (6, 6));
+        assert_eq!(ctrl.max(), 6);
+        // 热改每账号值被拒绝
+        assert!(ctrl.set_per_account(20, 100).is_err());
+        assert_eq!(ctrl.max(), 6);
     }
 
     /// 首字节超时读取：默认 32 / env 覆盖 / 0 禁用 / 非法回退。
