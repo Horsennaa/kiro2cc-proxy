@@ -1,0 +1,47 @@
+name: Build Upstream Test Image (controlled)
+
+# Controlled build for temporary IdC verification.
+# Triggers ONLY on tag v2.5.9-upstream-test. Pushes ONLY that single tag.
+# Does NOT push :latest, :beta, or any floating tag. Image binary = pure upstream v2.5.9.
+
+on:
+  push:
+    tags:
+      - 'v2.5.9-upstream-test'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Lowercase owner
+        run: echo "IMAGE_OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Build and push (single tag only)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ghcr.io/${{ env.IMAGE_OWNER }}/kiro2cc-proxy:v2.5.9-upstream-test
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=kiro2cc-proxy PURE UPSTREAM v2.5.9 (temporary IdC verification image)
