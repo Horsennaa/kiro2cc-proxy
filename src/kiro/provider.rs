@@ -490,7 +490,26 @@ impl KiroProvider {
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {}", ctx.token)).unwrap(),
         );
+        // IdC/企业号需要 TokenType: EXTERNAL_IDP 头（对齐 kiro-account-manager 客户端），
+        // 否则 Amazon Q 返回 403 bearer token invalid。Social 号不需要该头。
+        if Self::is_external_idp(&ctx.credentials) {
+            headers.insert("TokenType", HeaderValue::from_static("EXTERNAL_IDP"));
+        }
         Ok(headers)
+    }
+
+    /// 判断账号是否为 IdC/企业号（external_idp），用于附加 TokenType 头
+    fn is_external_idp(credentials: &KiroCredentials) -> bool {
+        credentials
+            .auth_method
+            .as_deref()
+            .map(|m| {
+                m.eq_ignore_ascii_case("idc")
+                    || m.eq_ignore_ascii_case("external_idp")
+                    || m.eq_ignore_ascii_case("builder-id")
+                    || m.eq_ignore_ascii_case("iam")
+            })
+            .unwrap_or(false)
     }
 
     /// 构建 MCP 请求头
@@ -533,6 +552,9 @@ impl KiroProvider {
             "Authorization",
             HeaderValue::from_str(&format!("Bearer {}", ctx.token)).unwrap(),
         );
+        if Self::is_external_idp(&ctx.credentials) {
+            headers.insert("TokenType", HeaderValue::from_static("EXTERNAL_IDP"));
+        }
         Ok(headers)
     }
 
