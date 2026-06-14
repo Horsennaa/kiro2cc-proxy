@@ -1,0 +1,49 @@
+name: IdC TokenType test build (single tag, no latest)
+
+# 受控验证镜像：仅在推 git tag `idc-tokentype-test` 时触发，只推单镜像 tag v2.2.26-gw-idctest，绝不动 :latest/:beta。
+# 关键：git tag 故意不以 v 开头，避免触发 docker-build.yaml(v*) 与 build.yml(v*-gw*)——
+# 后者会把 :latest 覆盖、并把回滚锚点 v2.2.23-gw 重指向，必须规避。
+# 沿用 ai-gateway-manager v2.5.9 验证期的受控构建范式。
+on:
+  push:
+    tags:
+      - 'idc-tokentype-test'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Lowercase owner
+        run: echo "IMAGE_OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Build and push (single tag only)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/${{ env.IMAGE_OWNER }}/kiro2cc-proxy:v2.2.26-gw-idctest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=kiro2cc-proxy IdC TokenType test build
