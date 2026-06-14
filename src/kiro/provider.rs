@@ -437,6 +437,37 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    /// 用「被选中账号」的 profileArn 改写请求体顶层 profileArn。
+    ///
+    /// 背景：请求体在 handler 阶段构造时，profileArn 取的是启动时冻结的
+    /// 全局首账号 ARN（main.rs first_credentials）。但账号选择/故障转移在
+    /// 本文件 call_api_with_retry 中才发生，每次尝试可能选中不同账号。
+    /// social 号共用同一 ARN 不受影响；IdC 号 ARN 不同，若不改写会用错 ARN
+    /// 导致 token 账号与 ARN 账号不匹配 → AWS 403。
+    ///
+    /// 行为：选中账号有自己的 profile_arn 时改写为该值；为 None 时保持
+    /// 请求体原值（= 全局冻结 ARN，保持 social 号现有行为不变，避免回归）。
+    /// 解析或改写失败时回退到原始 body，不阻断请求。
+    fn rewrite_profile_arn_for(ctx: &CallContext, request_body: &str) -> String {
+        let Some(arn) = ctx.credentials.profile_arn.as_deref() else {
+            return request_body.to_string();
+        };
+        let mut json: serde_json::Value = match serde_json::from_str(request_body) {
+            Ok(v) => v,
+            Err(_) => return request_body.to_string(),
+        };
+        match json.as_object_mut() {
+            Some(obj) => {
+                obj.insert(
+                    "profileArn".to_string(),
+                    serde_json::Value::String(arn.to_string()),
+                );
+            }
+            None => return request_body.to_string(),
+        }
+        serde_json::to_string(&json).unwrap_or_else(|_| request_body.to_string())
+    }
+
     /// 构建请求头
     ///
     /// # Arguments
@@ -773,7 +804,7 @@ impl KiroProvider {
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .headers(headers)
-                .body(request_body.to_string())
+                .body(Self::rewrite_profile_arn_for(&ctx, request_body))
                 .send();
             let send_result = if fb_timeout > 0 {
                 match tokio::time::timeout(Duration::from_secs(fb_timeout), send_fut).await {
@@ -1268,5 +1299,46 @@ mod tests {
         let spectask_body = r#"{"conversationState":{"agentTaskType":"spectask"}}"#;
         let headers = provider.build_headers(&ctx, spectask_body).unwrap();
         assert_eq!(headers.get("x-amzn-kiro-agent-mode").unwrap(), "spectask");
+    }
+
+    #[test]
+    fn test_rewrite_profile_arn_uses_selected_account() {
+        // 选中账号有自己的 ARN → body 须改写为该 ARN（覆盖原全局冻结值）
+        let mut credentials = KiroCredentials::default();
+        credentials.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:635755678255:profile/RNEKHHC4PU3R".to_string());
+        let ctx = CallContext {
+            id: 15,
+            credentials,
+            token: "t".to_string(),
+        };
+        // 原 body 携的是全局首账号（social）ARN
+        let body = r#"{"conversationState":{"x":1},"profileArn":"arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"}"#;
+        let out = KiroProvider::rewrite_profile_arn_for(&ctx, body);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.get("profileArn").unwrap().as_str().unwrap(),
+            "arn:aws:codewhisperer:us-east-1:635755678255:profile/RNEKHHC4PU3R"
+        );
+        // conversationState 不被破坏
+        assert_eq!(v.get("conversationState").unwrap().get("x").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_rewrite_profile_arn_none_keeps_original() {
+        // 选中账号无 ARN → 保持 body 原值（social 回退行为，不回归）
+        let credentials = KiroCredentials::default(); // profile_arn = None
+        let ctx = CallContext {
+            id: 9,
+            credentials,
+            token: "t".to_string(),
+        };
+        let body = r#"{"conversationState":{},"profileArn":"arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"}"#;
+        let out = KiroProvider::rewrite_profile_arn_for(&ctx, body);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.get("profileArn").unwrap().as_str().unwrap(),
+            "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+        );
     }
 }
