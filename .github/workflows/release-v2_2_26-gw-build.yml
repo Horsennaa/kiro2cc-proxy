@@ -1,0 +1,52 @@
+name: Release v2.2.26-gw (controlled single tag, no latest/anchor)
+
+# 正式发布镜像 v2.2.26-gw（arnfix + arnfix2 转正）。
+# 受控构建：仅在推 git tag `release-v2.2.26-gw` 时触发，只推单镜像 tag v2.2.26-gw。
+# 关键：git tag 故意不以 v 开头，避免触发：
+#   - docker-build.yaml(v*)  → 会移动 :latest
+#   - build.yaml(v*)         → 仅产物，但无谓触发
+#   - build.yml(v*-gw*)      → 会用 type=raw,value=v2.2.23-gw 覆盖回滚锚点镜像 tag！
+# 生产由 SSM 按精确 tag v2.2.26-gw 部署，无需移动 :latest/:beta/锚点。
+on:
+  push:
+    tags:
+      - 'release-v2.2.26-gw'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Lowercase owner
+        run: echo "IMAGE_OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Build and push (single tag only)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/${{ env.IMAGE_OWNER }}/kiro2cc-proxy:v2.2.26-gw
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=kiro2cc-proxy v2.2.26-gw (IdC profileArn ingest + per-account ARN fix)
