@@ -155,7 +155,22 @@ pub(crate) async fn refresh_token(
         }
     });
 
-    if auth_method.eq_ignore_ascii_case("idc")
+    if auth_method.eq_ignore_ascii_case("external_idp") {
+        // external_idp（Azure AD 等外部 IdP）的 accessToken 由外部刷新流程维护，
+        // 其 refreshToken 只能在对应 IdP 的 OIDC 端点刷新（非 kiro.dev Social / 非 AWS OIDC）。
+        // 这里不做刷新，直接沿用已提供的 accessToken；token 时效由外部推送脚本负责。
+        if credentials
+            .access_token
+            .as_deref()
+            .map(|t| !t.is_empty())
+            .unwrap_or(false)
+        {
+            tracing::info!("external_idp 账号跳过刷新，沿用已提供 accessToken");
+            Ok(credentials.clone())
+        } else {
+            bail!("external_idp 账号缺少 accessToken，无法使用（刷新由外部流程负责）")
+        }
+    } else if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
