@@ -106,6 +106,14 @@ pub struct AddCredentialRequest {
     /// external_idp 号不走刷新，expires_at 为 None 时 is_token_expired 会判"已过期"致录入即失败，必须录入时显式提供
     pub expires_at: Option<String>,
 
+    /// 外部 IdP OIDC token 刷新端点 URL（camelCase 自动映射 tokenEndpoint）
+    /// 仅 external_idp 内部自动刷新需要；提供后 kiro2cc 临期自动刷新该账号 token
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP 刷新 token 携带的 scope（空格分隔，camelCase 自动映射 scopes）
+    /// 仅 external_idp 内部自动刷新需要
+    pub scopes: Option<String>,
+
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,

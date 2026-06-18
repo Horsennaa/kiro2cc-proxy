@@ -47,6 +47,18 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
 
+    /// 外部 IdP (Azure AD/Microsoft Entra 等) 的 OIDC token 刷新端点 URL
+    /// 形如 https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token
+    /// 仅 external_idp 账号需要；存在时 kiro2cc 内部自动刷新该账号 token
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP 刷新 token 时携带的 scope（空格分隔）
+    /// 形如 api://<clientId>/codewhisperer:conversations api://<clientId>/codewhisperer:completions offline_access
+    /// 仅 external_idp 内部刷新需要
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+
     /// 账号优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
@@ -338,6 +350,8 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -457,6 +471,8 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            scopes: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -488,6 +504,8 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -601,6 +619,8 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            scopes: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
             auth_region: None,

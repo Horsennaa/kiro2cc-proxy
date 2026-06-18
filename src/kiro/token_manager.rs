@@ -20,7 +20,8 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
@@ -156,19 +157,26 @@ pub(crate) async fn refresh_token(
     });
 
     if auth_method.eq_ignore_ascii_case("external_idp") {
-        // external_idp（Azure AD 等外部 IdP）的 accessToken 由外部刷新流程维护，
-        // 其 refreshToken 只能在对应 IdP 的 OIDC 端点刷新（非 kiro.dev Social / 非 AWS OIDC）。
-        // 这里不做刷新，直接沿用已提供的 accessToken；token 时效由外部推送脚本负责。
+        // external_idp（Azure AD / Microsoft Entra 等外部 IdP）账号。
+        // 若凭据带 token_endpoint，则走对应 IdP 的 OIDC 端点内部刷新（自动续期）；
+        // 否则退回旧行为：不刷新，沿用已提供的 accessToken（由外部流程维护）。
         if credentials
+            .token_endpoint
+            .as_deref()
+            .map(|t| !t.is_empty())
+            .unwrap_or(false)
+        {
+            refresh_external_idp_token(credentials, config, proxy).await
+        } else if credentials
             .access_token
             .as_deref()
             .map(|t| !t.is_empty())
             .unwrap_or(false)
         {
-            tracing::info!("external_idp 账号跳过刷新，沿用已提供 accessToken");
+            tracing::info!("external_idp 账号无 token_endpoint，跳过刷新，沿用已提供 accessToken");
             Ok(credentials.clone())
         } else {
-            bail!("external_idp 账号缺少 accessToken，无法使用（刷新由外部流程负责）")
+            bail!("external_idp 账号缺少 accessToken 且无 token_endpoint，无法刷新")
         }
     } else if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
@@ -361,6 +369,88 @@ async fn refresh_idc_token(
     // Amazon Q generateAssistantResponse 需要 idToken（JWT），accessToken 是 SSO portal session token
     new_credentials.access_token = Some(data.id_token.unwrap_or(data.access_token));
 
+    if let Some(new_refresh_token) = data.refresh_token {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    Ok(new_credentials)
+}
+
+/// 刷新 external_idp Token (Azure AD / Microsoft Entra 等外部 IdP 的 OIDC 端点)
+///
+/// 与 Social/IdC 不同：请求体是标准 OAuth2 form-urlencoded（非 JSON），
+/// 端点是凭据里存的 token_endpoint（如 login.microsoftonline.com/<tenant>/oauth2/v2.0/token）。
+/// 微软返回 access_token + 新 refresh_token（会轮换）+ expires_in；profileArn 不变（沿用凭据已有）。
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 external_idp Token (外部 IdP OIDC)...");
+
+    let refresh_token = credentials
+        .refresh_token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("external_idp 刷新需要 refreshToken（凭据缺失该字段）"))?;
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("external_idp 刷新需要 tokenEndpoint（凭据缺失该字段）"))?;
+    let client_id = credentials
+        .client_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("external_idp 刷新需要 clientId（凭据缺失该字段）"))?;
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    // 标准 OAuth2 refresh_token grant，form-urlencoded
+    let mut form: Vec<(&str, &str)> = vec![
+        ("grant_type", "refresh_token"),
+        ("client_id", client_id.as_str()),
+        ("refresh_token", refresh_token.as_str()),
+    ];
+    // scope 可选：微软要求带 api://<clientId>/... 前缀的 scope（去掉前缀会 400）
+    if let Some(scopes) = credentials.scopes.as_deref().filter(|s| !s.is_empty()) {
+        form.push(("scope", scopes));
+    }
+    // client_secret 可选：PKCE 公共客户端为空时不带
+    if let Some(secret) = credentials.client_secret.as_deref().filter(|s| !s.is_empty()) {
+        form.push(("client_secret", secret));
+    }
+
+    let response = client
+        .post(token_endpoint)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let error_msg = match status.as_u16() {
+            400 => "external_idp 刷新请求无效（scope/client_id/refresh_token 不匹配）",
+            401 => "external_idp 凭证已过期或无效，需要重新认证",
+            403 => "权限不足，无法刷新 external_idp Token",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，外部 IdP OIDC 服务暂时不可用",
+            _ => "external_idp Token 刷新失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: ExternalIdpRefreshResponse = response.json().await?;
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(data.access_token);
+
+    // 微软会轮换 refresh_token，必须回写新值，否则旧 refresh_token 可能失效
     if let Some(new_refresh_token) = data.refresh_token {
         new_credentials.refresh_token = Some(new_refresh_token);
     }
