@@ -228,7 +228,7 @@ impl AdminService {
         let email = req.email.clone();
         let new_cred = KiroCredentials {
             id: None,
-            access_token: None,
+            access_token: req.access_token,
             refresh_token: Some(req.refresh_token),
             profile_arn: req.profile_arn,
             expires_at: None,

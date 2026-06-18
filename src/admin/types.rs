@@ -98,6 +98,10 @@ pub struct AddCredentialRequest {
     /// IdC 号的 OIDC 刷新响应不含 profileArn，必须录入时显式提供，否则发请求缺 ARN 导致 AWS 403
     pub profile_arn: Option<String>,
 
+    /// Access Token（external_idp 认证需要，camelCase 自动映射 accessToken）
+    /// external_idp 号不走 Social/IdC 刷新，accessToken 由外部流程提供并维护，必须录入时显式提供
+    pub access_token: Option<String>,
+
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
