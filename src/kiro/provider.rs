@@ -521,7 +521,21 @@ impl KiroProvider {
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {}", ctx.token)).unwrap(),
         );
+        // external_idp (Azure AD) 账号需要 TokenType 头，否则 Bedrock 返回 401 Bad credentials
+        if Self::is_external_idp(&ctx.credentials) {
+            headers.insert("TokenType", HeaderValue::from_static("EXTERNAL_IDP"));
+        }
         Ok(headers)
+    }
+
+    /// 判断账号是否为 external_idp（Azure AD / 外部 IdP），用于附加 TokenType 头
+    /// 注意：AWS IdC 企业号（auth_method="idc"）不需要此头
+    fn is_external_idp(credentials: &KiroCredentials) -> bool {
+        credentials
+            .auth_method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("external_idp"))
+            .unwrap_or(false)
     }
 
     /// 构建 MCP 请求头
@@ -564,6 +578,9 @@ impl KiroProvider {
             "Authorization",
             HeaderValue::from_str(&format!("Bearer {}", ctx.token)).unwrap(),
         );
+        if Self::is_external_idp(&ctx.credentials) {
+            headers.insert("TokenType", HeaderValue::from_static("EXTERNAL_IDP"));
+        }
         Ok(headers)
     }
 
