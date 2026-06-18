@@ -102,6 +102,10 @@ pub struct AddCredentialRequest {
     /// external_idp 号不走 Social/IdC 刷新，accessToken 由外部流程提供并维护，必须录入时显式提供
     pub access_token: Option<String>,
 
+    /// Token 过期时间（RFC3339 格式，camelCase 自动映射 expiresAt）
+    /// external_idp 号不走刷新，expires_at 为 None 时 is_token_expired 会判"已过期"致录入即失败，必须录入时显式提供
+    pub expires_at: Option<String>,
+
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,

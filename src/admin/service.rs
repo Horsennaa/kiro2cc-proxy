@@ -231,7 +231,7 @@ impl AdminService {
             access_token: req.access_token,
             refresh_token: Some(req.refresh_token),
             profile_arn: req.profile_arn,
-            expires_at: None,
+            expires_at: req.expires_at,
             auth_method: Some(req.auth_method),
             client_id: req.client_id,
             client_secret: req.client_secret,
