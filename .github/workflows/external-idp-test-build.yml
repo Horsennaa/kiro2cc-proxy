@@ -41,7 +41,7 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ghcr.io/${{ env.IMAGE_OWNER }}/kiro2cc-proxy:v2.2.27-gw-extidp
+            ghcr.io/${{ env.IMAGE_OWNER }}/kiro2cc-proxy:v2.2.28-gw-extidp
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=kiro2cc-proxy external IdP TokenType test build
