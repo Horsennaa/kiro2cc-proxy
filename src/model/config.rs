@@ -98,6 +98,12 @@ pub struct Config {
     #[serde(default)]
     pub quota_aware_selection: bool,
 
+    /// 是否向上游发送 additionalModelRequestFields（thinking/output_config/max_tokens）。
+    /// 默认关闭：部分 Amazon Q 端点（如 external_idp/profileArn 路径）不支持该字段，
+    /// 发送会被 400 REQUEST_BODY_INVALID 拒绝。仅在确认上游支持时手动开启。
+    #[serde(default)]
+    pub send_additional_model_request_fields: bool,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -169,6 +175,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             max_rpm_per_credential: default_max_rpm_per_credential(),
             quota_aware_selection: false,
+            send_additional_model_request_fields: false,
             config_path: None,
         }
     }

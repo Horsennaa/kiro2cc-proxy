@@ -44,6 +44,8 @@ pub struct AppState {
     pub usage_tracker: Option<Arc<UsageTracker>>,
     /// RPM 追踪器（可选，启用 RPM 实时监控）
     pub rpm_tracker: Option<Arc<RpmTracker>>,
+    /// 是否向上游发送 additionalModelRequestFields（默认 false，部分 Q 端点不支持）
+    pub send_additional_model_request_fields: bool,
 }
 
 impl AppState {
@@ -56,12 +58,19 @@ impl AppState {
             api_key_manager: None,
             usage_tracker: None,
             rpm_tracker: None,
+            send_additional_model_request_fields: false,
         }
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    /// 设置是否发送 additionalModelRequestFields
+    pub fn with_send_additional_model_request_fields(mut self, enabled: bool) -> Self {
+        self.send_additional_model_request_fields = enabled;
         self
     }
 
