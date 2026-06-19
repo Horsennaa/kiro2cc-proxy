@@ -1,0 +1,48 @@
+name: Merge v2.6.2 test build (single tag, no latest)
+
+# 受控验证镜像：仅在推 git tag `merge-v262-test` 时触发，只推镜像 tag
+# v2.2.31-gw-merge-test，绝不动 :latest/:beta。
+# 关键：git tag 故意不以 v 开头，避免触发 docker-build.yaml(v*) 与 build.yml(v*-gw*)。
+on:
+  push:
+    tags:
+      - 'merge-v262-test'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Lowercase owner
+        run: echo "IMAGE_OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Build and push (single tag only)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/${{ env.IMAGE_OWNER }}/kiro2cc-proxy:v2.2.31-gw-merge-test
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=kiro2cc-proxy upstream v2.6.2 merge (P1+P2) test build
