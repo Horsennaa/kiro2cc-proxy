@@ -708,6 +708,8 @@ pub struct MultiTokenManager {
     sticky_cache: Mutex<HashMap<String, StickyCacheEntry>>,
     /// 持久化串行锁：串行化 credentials/stats 的序列化+写盘，避免多路径并发交错写
     persist_lock: Mutex<()>,
+    /// RPM 限流器（per-account 主闸门 + global 兜底，选号时预占）
+    rpm_limiter: crate::kiro::rpm_limiter::RpmLimiter,
 }
 
 /// 每个账号最大 API 调用失败次数
@@ -859,6 +861,7 @@ impl MultiTokenManager {
             rr_counter: AtomicU64::new(0),
             sticky_cache: Mutex::new(HashMap::new()),
             persist_lock: Mutex::new(()),
+            rpm_limiter: crate::kiro::rpm_limiter::RpmLimiter::new(),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -947,12 +950,48 @@ impl MultiTokenManager {
             .filter(|e| Self::compute_health(e) != HealthStatus::Unhealthy)
             .copied()
             .collect();
-        let pool: &[&CredentialEntry] = if preferred.is_empty() { &available } else { &preferred };
+        let health_pool: &[&CredentialEntry] = if preferred.is_empty() { &available } else { &preferred };
+
+        // RPM 限流过滤：跳过当前 60s 窗口已达单账号阈值的账号。
+        // 若全局已达兜底上限，或所有账号都到顶 → 返回 None（上层触发对客户端的退避，不往 AWS 灌）。
+        let rl = &self.config.rate_limit;
+        let pool_vec: Vec<&CredentialEntry> = if rl.enabled {
+            // 全局兜底：超过 global_rpm 直接拒绝本次选号
+            if !self.rpm_limiter.global_under_limit(rl.global_rpm) {
+                tracing::warn!(
+                    evt = "rpm_global_limited",
+                    global_rpm = self.rpm_limiter.global_rpm(),
+                    global_limit = rl.global_rpm,
+                    "全局 RPM 达上限，拒绝选号以触发客户端退避"
+                );
+                return None;
+            }
+            let filtered: Vec<&CredentialEntry> = health_pool
+                .iter()
+                .copied()
+                .filter(|e| {
+                    let limit = rl.limit_for(e.credentials.auth_method.as_deref(), e.id);
+                    self.rpm_limiter.credential_under_limit(e.id, limit)
+                })
+                .collect();
+            if filtered.is_empty() {
+                tracing::warn!(
+                    evt = "rpm_all_limited",
+                    candidates = health_pool.len(),
+                    "所有候选账号均达单账号 RPM 阈值，拒绝选号以触发客户端退避"
+                );
+                return None;
+            }
+            filtered
+        } else {
+            health_pool.iter().copied().collect()
+        };
+        let pool: &[&CredentialEntry] = &pool_vec;
 
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
 
-        match mode {
+        let selected = match mode {
             "balanced" => {
                 // Round-Robin 策略：均匀轮转所有可用账号
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
@@ -974,7 +1013,15 @@ impl MultiTokenManager {
                     Some((entry.id, entry.credentials.clone()))
                 }
             }
+        };
+
+        // 选中后立即预占 RPM 窗口（record-on-select），让飞行中的请求也计入，避免瞬时超发。
+        if rl.enabled {
+            if let Some((id, _)) = &selected {
+                self.rpm_limiter.record(*id);
+            }
         }
+        selected
     }
 
     /// 获取 API 调用上下文
@@ -1004,19 +1051,42 @@ impl MultiTokenManager {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 // balanced 模式：每次请求都轮询选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的账号
+                // priority 模式：优先使用 current_id 指向的账号（但需未达 RPM 阈值）
                 let current_hit = if is_balanced {
                     None
                 } else {
+                    let rl = &self.config.rate_limit;
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled && Self::compute_health(e) != HealthStatus::Unhealthy)
+                        .find(|e| {
+                            if e.id != current_id || e.disabled
+                                || Self::compute_health(e) == HealthStatus::Unhealthy
+                            {
+                                return false;
+                            }
+                            // RPM 限流：current 账号也须未达单账号阈值且全局未超限，
+                            // 否则不走 current 快通道，转而走 select_next_credential 轮换。
+                            if rl.enabled {
+                                if !self.rpm_limiter.global_under_limit(rl.global_rpm) {
+                                    return false;
+                                }
+                                let limit = rl.limit_for(e.credentials.auth_method.as_deref(), e.id);
+                                if !self.rpm_limiter.credential_under_limit(e.id, limit) {
+                                    return false;
+                                }
+                            }
+                            true
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
                 if let Some(hit) = current_hit {
+                    // 走 current 快通道也要预占 RPM（select_next_credential 被绕过了）
+                    if self.config.rate_limit.enabled {
+                        self.rpm_limiter.record(hit.0);
+                    }
                     hit
                 } else {
                     // 当前账号不可用或 balanced 模式，根据负载均衡策略选择
@@ -1162,11 +1232,40 @@ impl MultiTokenManager {
             }
         };
 
-        // 步骤 ③：尝试使用缓存账号
-        if let Some((id, credentials)) = cached {
+        // sticky 默认优先保护 prompt cache 命中（同会话黏同一账号），不因轻微超阈就换号。
+        // 但设一个硬上限（阈值 ×1.5）：账号严重超载时驱逐重选，避免单账号失控。
+        let sticky_hard_blocked = if let Some((id, creds)) = cached.as_ref() {
+            let rl = &self.config.rate_limit;
+            if rl.enabled {
+                let base = rl.limit_for(creds.auth_method.as_deref(), *id);
+                // base=0 表示该类型不限制，则 sticky 不拦
+                let hard = if base == 0 { 0 } else { base + base / 2 };
+                let global_blocked = !self.rpm_limiter.global_under_limit(rl.global_rpm);
+                let cred_blocked = !self.rpm_limiter.credential_under_limit(*id, hard);
+                global_blocked || cred_blocked
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if sticky_hard_blocked {
+            tracing::warn!(
+                evt = "rpm_sticky_evicted",
+                cid = cid,
+                "sticky 账号 RPM 严重超阈，驱逐重选以避免单账号失控"
+            );
+            self.sticky_cache.lock().remove(cid);
+        }
+
+        // 步骤 ③：尝试使用缓存账号（未被硬上限拦截时）
+        if let Some((id, credentials)) = cached.filter(|_| !sticky_hard_blocked) {
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
-                    // 命中成功，续期
+                    // 命中成功，续期 + 预占 RPM（sticky 路径绕过了 select_next_credential）
+                    if self.config.rate_limit.enabled {
+                        self.rpm_limiter.record(id);
+                    }
                     self.sticky_cache.lock().entry(cid.to_string()).and_modify(|e| {
                         e.inserted_at = Instant::now();
                     });
@@ -1177,7 +1276,7 @@ impl MultiTokenManager {
                     self.sticky_cache.lock().remove(cid);
                 }
             }
-        } else {
+        } else if !sticky_hard_blocked {
             // TTL 过期或不健康，清理旧条目
             self.sticky_cache.lock().remove(cid);
         }
