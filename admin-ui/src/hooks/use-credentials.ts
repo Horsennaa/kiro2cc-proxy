@@ -25,6 +25,8 @@ import {
   getCredentialUsageRecords,
   getDailyUsage,
   getDailyUsageRecords,
+  getThrottleLogs,
+  getFailureLogs,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpdateCredentialRequest, CreateApiKeyRequest, UpdateApiKeyRequest } from '@/types/api'
 
@@ -289,5 +291,25 @@ export function useDailyUsageRecords(date: string, page: number, pageSize = 50) 
     queryKey: ['dailyUsageRecords', date, page, pageSize],
     queryFn: () => getDailyUsageRecords(date, page, pageSize),
     enabled: !!date,
+  })
+}
+
+// ============ 失败日志 Hooks ============
+
+export function useFailureLogs(id: number, page: number, pageSize = 50) {
+  return useQuery({
+    queryKey: ['failureLogs', id, page, pageSize],
+    queryFn: () => getFailureLogs(id, page, pageSize),
+    enabled: id > 0,
+  })
+}
+
+// ============ 限流日志 Hooks ============
+
+export function useThrottleLogs(id: number, page: number, pageSize = 50) {
+  return useQuery({
+    queryKey: ['throttleLogs', id, page, pageSize],
+    queryFn: () => getThrottleLogs(id, page, pageSize),
+    enabled: id > 0,
   })
 }

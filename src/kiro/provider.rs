@@ -20,6 +20,8 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use crate::model::rpm::RpmTracker;
+use crate::model::failure_log::FailureLogStore;
+use crate::model::throttle_log::ThrottleLogStore;
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -269,6 +271,10 @@ pub struct KiroProvider {
     concurrency: Arc<ConcurrencyController>,
     /// RPM 追踪器（可选，用于记录账号维度的 RPM）
     rpm_tracker: Option<Arc<RpmTracker>>,
+    /// 限流日志存储（可选）
+    throttle_log_store: Option<Arc<ThrottleLogStore>>,
+    /// 失败日志存储（可选）
+    failure_log_store: Option<Arc<FailureLogStore>>,
 }
 
 #[allow(dead_code)]
@@ -305,6 +311,8 @@ impl KiroProvider {
             tls_backend,
             concurrency: ConcurrencyController::new(max_concurrent, per_account, absolute_lock),
             rpm_tracker: None,
+            throttle_log_store: None,
+            failure_log_store: None,
         }
     }
 
@@ -330,6 +338,18 @@ impl KiroProvider {
     /// 集中在 controller 处理排队埋点，两个调用点共用，cancel-safe。
     async fn acquire_permit(&self) -> anyhow::Result<OwnedSemaphorePermit> {
         self.concurrency.acquire().await
+    }
+
+    /// 设置限流日志存储
+    pub fn with_throttle_log_store(mut self, store: Arc<ThrottleLogStore>) -> Self {
+        self.throttle_log_store = Some(store);
+        self
+    }
+
+    /// 设置失败日志存储
+    pub fn with_failure_log_store(mut self, store: Arc<FailureLogStore>) -> Self {
+        self.failure_log_store = Some(store);
+        self
     }
 
     /// 根据账号的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -473,7 +493,7 @@ impl KiroProvider {
     /// # Arguments
     /// * `ctx` - API 调用上下文，包含账号和 token
     /// * `request_body` - 请求体，用于提取 agentTaskType
-    fn build_headers(&self, ctx: &CallContext, request_body: &str) -> anyhow::Result<HeaderMap> {
+    fn build_headers(&self, ctx: &CallContext, request_body: &str, attempt: usize) -> anyhow::Result<HeaderMap> {
         let config = self.token_manager.config();
 
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config)
@@ -515,7 +535,7 @@ impl KiroProvider {
         );
         headers.insert(
             "amz-sdk-request",
-            HeaderValue::from_static("attempt=1; max=3"),
+            HeaderValue::from_str(&format!("attempt={}; max=3", attempt + 1)).unwrap(),
         );
         headers.insert(
             AUTHORIZATION,
@@ -539,7 +559,7 @@ impl KiroProvider {
     }
 
     /// 构建 MCP 请求头
-    fn build_mcp_headers(&self, ctx: &CallContext) -> anyhow::Result<HeaderMap> {
+    fn build_mcp_headers(&self, ctx: &CallContext, attempt: usize) -> anyhow::Result<HeaderMap> {
         let config = self.token_manager.config();
 
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config)
@@ -572,7 +592,7 @@ impl KiroProvider {
         );
         headers.insert(
             "amz-sdk-request",
-            HeaderValue::from_static("attempt=1; max=3"),
+            HeaderValue::from_str(&format!("attempt={}; max=3", attempt + 1)).unwrap(),
         );
         headers.insert(
             "Authorization",
@@ -650,8 +670,13 @@ impl KiroProvider {
                 }
             };
 
+            // 全局+单账号并发由 ConcurrencyController 统一控制（见函数入口 acquire_permit）
+
+            // RPM 硬限制
+            self.wait_for_rpm_gate(ctx.id, " (mcp)").await;
+
             let url = self.mcp_url_for(&ctx.credentials);
-            let headers = match self.build_mcp_headers(&ctx) {
+            let headers = match self.build_mcp_headers(&ctx, attempt) {
                 Ok(h) => h,
                 Err(e) => {
                     last_error = Some(e);
@@ -660,8 +685,14 @@ impl KiroProvider {
             };
 
             // 发送请求
-            let response = match self
-                .client_for(&ctx.credentials)?
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+            let response = match client
                 .post(&url)
                 .headers(headers)
                 .body(request_body.to_string())
@@ -716,6 +747,9 @@ impl KiroProvider {
             // 401/403 账号问题
             if matches!(status.as_u16(), 401 | 403) {
                 let has_available = self.token_manager.report_failure(ctx.id);
+                if let Some(ref store) = self.failure_log_store {
+                    store.record(ctx.id, "mcp", status.as_u16(), &body);
+                }
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有账号已用尽）: {} {}", status, body);
                 }
@@ -734,9 +768,12 @@ impl KiroProvider {
                 );
                 self.token_manager.report_throttled(ctx.id);
                 self.token_manager.report_success(ctx.id);
+                if let Some(ref store) = self.throttle_log_store {
+                    store.record(ctx.id, "mcp", status.as_u16(), &body);
+                }
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    sleep(Self::throttle_delay(attempt)).await;
                 }
                 continue;
             }
@@ -806,8 +843,13 @@ impl KiroProvider {
                 }
             };
 
+            // 全局+单账号并发由 ConcurrencyController 统一控制（见函数入口 acquire_permit）
+
+            // RPM 硬限制：超出时等待后重试（最多等 2 次，共 6 秒）
+            self.wait_for_rpm_gate(ctx.id, "").await;
+
             let url = self.base_url_for(&ctx.credentials);
-            let headers = match self.build_headers(&ctx, request_body) {
+            let headers = match self.build_headers(&ctx, request_body, attempt) {
                 Ok(h) => h,
                 Err(e) => {
                     last_error = Some(e);
@@ -816,9 +858,15 @@ impl KiroProvider {
             };
 
             // 发送请求（首字节超时保护：仅 .send() 阶段，不影响后续 body 流式读取）
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
             let fb_timeout = first_byte_timeout_secs();
-            let send_fut = self
-                .client_for(&ctx.credentials)?
+            let send_fut = client
                 .post(&url)
                 .headers(headers)
                 .body(Self::rewrite_profile_arn_for(&ctx, request_body))
@@ -856,8 +904,6 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用账号"或"切换账号"
-                    // （否则一段时间网络抖动会把所有账号都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -939,6 +985,9 @@ impl KiroProvider {
                 );
 
                 let has_available = self.token_manager.report_failure(ctx.id);
+                if let Some(ref store) = self.failure_log_store {
+                    store.record(ctx.id, "api", status.as_u16(), &body);
+                }
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有账号已用尽）: {} {}",
@@ -976,6 +1025,9 @@ impl KiroProvider {
                 self.token_manager.report_throttled(ctx.id);
                 // 递增 success_count，使 balanced 模式下一次 acquire_context 选择其他账号
                 self.token_manager.report_success(ctx.id);
+                if let Some(ref store) = self.throttle_log_store {
+                    store.record(ctx.id, "api", status.as_u16(), &body);
+                }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
@@ -1076,6 +1128,31 @@ impl KiroProvider {
         let jitter_max = (backoff / 3).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    /// RPM 硬限制：超出时等待后放行（最多等 2 次，共 6 秒）。
+    /// 依赖 config.max_rpm_per_credential（0 表示不限制）。
+    async fn wait_for_rpm_gate(&self, credential_id: u64, tag: &str) {
+        if let Some(rpm) = &self.rpm_tracker {
+            let max_rpm = self.token_manager.config().max_rpm_per_credential;
+            if max_rpm > 0 {
+                let mut rpm_waits = 0;
+                while rpm.credential_rpm(credential_id) >= max_rpm as u64 && rpm_waits < 2 {
+                    tracing::info!(
+                        "[RPM-GATE] credential={} rpm={} limit={}, waiting 3s{}",
+                        credential_id, rpm.credential_rpm(credential_id), max_rpm, tag
+                    );
+                    sleep(Duration::from_secs(3)).await;
+                    rpm_waits += 1;
+                }
+                if rpm.credential_rpm(credential_id) >= max_rpm as u64 {
+                    tracing::warn!(
+                        "[RPM-GATE] credential={} still over limit after wait{}, proceeding anyway",
+                        credential_id, tag
+                    );
+                }
+            }
+        }
     }
 
     fn is_monthly_request_limit(body: &str) -> bool {
@@ -1244,7 +1321,7 @@ mod tests {
             credentials,
             token: "test_token".to_string(),
         };
-        let headers = provider.build_headers(&ctx, "{}").unwrap();
+        let headers = provider.build_headers(&ctx, "{}", 0).unwrap();
 
         assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
         assert_eq!(headers.get("x-amzn-codewhisperer-optout").unwrap(), "true");
@@ -1314,7 +1391,7 @@ mod tests {
             token: "test_token".to_string(),
         };
         let spectask_body = r#"{"conversationState":{"agentTaskType":"spectask"}}"#;
-        let headers = provider.build_headers(&ctx, spectask_body).unwrap();
+        let headers = provider.build_headers(&ctx, spectask_body, 0).unwrap();
         assert_eq!(headers.get("x-amzn-kiro-agent-mode").unwrap(), "spectask");
     }
 

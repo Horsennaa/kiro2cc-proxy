@@ -20,7 +20,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
-use tokio::time::interval;
+use tokio::time::{interval, interval_at, Instant};
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
@@ -127,6 +127,7 @@ fn map_provider_error_with_context(err: Error, model: &str, estimated_input_toke
 /// 替代 axum 的 `Json<MessagesRequest>` 提取器——后者反序列化失败时直接返回 400
 /// 且不记录任何信息，导致无法定位是哪个字段/格式导致客户端请求被拒。
 /// 此函数在失败时打印 serde 错误（行列+字段路径）、body 长度、出错位置附近的片段。
+#[allow(clippy::result_large_err)]
 fn parse_messages_request(body: &[u8]) -> Result<MessagesRequest, Response> {
     match serde_json::from_slice::<MessagesRequest>(body) {
         Ok(req) => Ok(req),
@@ -234,7 +235,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 16000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-opus-4-20250514".to_string(),
@@ -243,7 +244,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 16000,
+            max_tokens: 64000,
         },
         // === 当前主力模型 ===
         Model {
@@ -253,7 +254,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-sonnet-4-5-20250929-thinking".to_string(),
@@ -262,7 +263,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-opus-4-5-20251101".to_string(),
@@ -271,7 +272,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-opus-4-5-20251101-thinking".to_string(),
@@ -280,7 +281,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-sonnet-4-6".to_string(),
@@ -289,7 +290,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.6".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-sonnet-4-6-thinking".to_string(),
@@ -298,7 +299,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-opus-4-6".to_string(),
@@ -307,7 +308,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 128000,
         },
         Model {
             id: "claude-opus-4-6-thinking".to_string(),
@@ -316,7 +317,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 128000,
         },
         Model {
             id: "claude-opus-4-7".to_string(),
@@ -325,7 +326,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.7".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 128000,
         },
         Model {
             id: "claude-opus-4-7-thinking".to_string(),
@@ -334,7 +335,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.7 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 128000,
         },
         Model {
             id: "claude-opus-4-8".to_string(),
@@ -343,7 +344,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.8".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 128000,
         },
         Model {
             id: "claude-opus-4-8-thinking".to_string(),
@@ -352,7 +353,25 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.8 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-fable-5".to_string(),
+            object: "model".to_string(),
+            created: 1772582400,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-fable-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1772582400,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
         },
         Model {
             id: "claude-haiku-4-5-20251001".to_string(),
@@ -361,7 +380,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         Model {
             id: "claude-haiku-4-5-20251001-thinking".to_string(),
@@ -370,7 +389,7 @@ fn build_model_list() -> Vec<Model> {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 32000,
+            max_tokens: 64000,
         },
         // === 非 Claude 模型 ===
         Model {
@@ -551,6 +570,7 @@ pub async fn post_messages(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: state.profile_arn.clone(),
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -638,6 +658,7 @@ pub async fn post_messages(
 }
 
 /// 处理流式请求
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -821,10 +842,10 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-/// 上下文窗口大小（200K tokens）
-const CONTEXT_WINDOW_SIZE: i32 = 200_000;
+use super::stream::context_window_for_model;
 
 /// 处理非流式请求
+#[allow(clippy::too_many_arguments)]
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -873,6 +894,7 @@ async fn handle_non_stream_request(
     let mut context_input_tokens: Option<i32> = None;
     let mut metering_cache_read_tokens: Option<i32> = None;
     let mut metering_cache_creation_tokens: Option<i32> = None;
+    let mut metering_usage: Option<f64> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -892,7 +914,7 @@ async fn handle_non_stream_request(
                             // 累积工具的 JSON 输入
                             let buffer = tool_json_buffers
                                 .entry(tool_use.tool_use_id.clone())
-                                .or_insert_with(String::new);
+                                .or_default();
                             buffer.push_str(&tool_use.input);
 
                             // 如果是完整的工具调用，添加到列表
@@ -919,32 +941,31 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            // 公式: percentage * 200_000 / 100 = percentage * 2000
+                            let window = context_window_for_model(model);
                             let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (CONTEXT_WINDOW_SIZE as f64)
+                                * (window as f64)
                                 / 100.0)
                                 as i32;
                             context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::info!(
-                                "[P0] contextUsageEvent: {:.2}% → input_tokens={} (200K窗口)",
+                                "[P0] contextUsageEvent: {:.2}% → input_tokens={} ({}窗口)",
                                 context_usage.context_usage_percentage,
-                                actual_input_tokens
+                                actual_input_tokens,
+                                window
                             );
                         }
                         Event::Metering(metering) => {
                             metering_cache_read_tokens = metering.cache_read_input_tokens;
                             metering_cache_creation_tokens = metering.cache_creation_input_tokens;
+                            metering_usage = Some(metering.usage);
                         }
-                        Event::Exception { exception_type, .. } => {
-                            if exception_type == "ContentLengthExceededException" {
+                        Event::Exception { exception_type, .. }
+                            if exception_type == "ContentLengthExceededException" => {
                                 stop_reason = "max_tokens".to_string();
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -992,7 +1013,7 @@ async fn handle_non_stream_request(
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let raw_final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
-    let final_input_tokens = super::stream::cap_input_tokens_pub(raw_final_input_tokens, input_tokens);
+    let final_input_tokens = super::stream::cap_input_tokens_pub(raw_final_input_tokens, input_tokens, model);
     tracing::info!(
         "[P0] input_tokens 决策: context_event={:?} estimated={} final={} (context_event 有值说明 contextUsageEvent 正常工作)",
         context_input_tokens, input_tokens, final_input_tokens
@@ -1001,12 +1022,14 @@ async fn handle_non_stream_request(
     // 对外报告的 output_tokens 限制在安全范围
     let reported_output_tokens = output_tokens.min(380);
 
-    // 优先使用 meteringEvent 中的真实 cache token，无则降级到模拟值
+    // 优先使用 meteringEvent 中的真实 cache token，次选 credits 反推，最后降级到模拟值
     let sim_usage = prompt_cache_usage.scale_to(final_input_tokens);
     let (report_input, report_cache_creation, report_cache_read) =
         if let (Some(read), Some(creation)) = (metering_cache_read_tokens, metering_cache_creation_tokens) {
-            let non_cached = final_input_tokens.saturating_sub(read).saturating_sub(creation);
-            (non_cached, creation, read)
+            (final_input_tokens.saturating_sub(read).saturating_sub(creation), creation, read)
+        } else if let Some(inferred) = crate::anthropic::stream::infer_cache_read_tokens(
+            final_input_tokens, metering_usage, output_tokens, model) {
+            (final_input_tokens.saturating_sub(inferred), 0, inferred)
         } else {
             (sim_usage.input_tokens, sim_usage.cache_creation_input_tokens, sim_usage.cache_read_input_tokens)
         };
@@ -1014,10 +1037,10 @@ async fn handle_non_stream_request(
     // 记录用量（内部使用真实值）
     if let (Some(tracker), Some(key_id)) = (&usage_tracker, api_key_id) {
         tracing::info!(
-            "[usage] 入库: model={} input={} output={} metering_credits=None credits_per_ktok=None effective_rate=None cache_read=None cache_creation=None api_key={} credential=Some({})",
-            model, final_input_tokens, output_tokens, key_id, credential_id
+            "[usage] 入库: model={} input={} output={} metering_credits={:?} cache_read={} cache_creation={} api_key={} credential=Some({})",
+            model, final_input_tokens, output_tokens, metering_usage, report_cache_read, report_cache_creation, key_id, credential_id
         );
-        tracker.record(key_id, Some(credential_id), model.to_string(), final_input_tokens, output_tokens, client_ip, None);
+        tracker.record(key_id, Some(credential_id), model.to_string(), final_input_tokens, output_tokens, client_ip, metering_usage, Some(report_cache_read), Some(report_cache_creation));
     }
 
     // 构建 Anthropic 响应
@@ -1070,22 +1093,20 @@ fn strip_json_fences(text: String) -> String {
 
 /// 从请求头或连接信息提取客户端真实 IP
 fn extract_client_ip(headers: &axum::http::HeaderMap, connect_info: Option<&std::net::SocketAddr>) -> Option<String> {
-    if let Some(val) = headers.get("x-forwarded-for") {
-        if let Ok(s) = val.to_str() {
+    if let Some(val) = headers.get("x-forwarded-for")
+        && let Ok(s) = val.to_str() {
             let ip = s.split(',').next().unwrap_or("").trim();
             if !ip.is_empty() {
                 return Some(ip.to_string());
             }
         }
-    }
-    if let Some(val) = headers.get("x-real-ip") {
-        if let Ok(s) = val.to_str() {
+    if let Some(val) = headers.get("x-real-ip")
+        && let Ok(s) = val.to_str() {
             let ip = s.trim();
             if !ip.is_empty() {
                 return Some(ip.to_string());
             }
         }
-    }
     connect_info.map(|addr| addr.ip().to_string())
 }
 
@@ -1149,7 +1170,7 @@ pub async fn count_tokens(
     ) as i32;
 
     Json(CountTokensResponse {
-        input_tokens: total_tokens.max(1) as i32,
+        input_tokens: total_tokens.max(1),
     })
 }
 
@@ -1246,6 +1267,7 @@ pub async fn post_messages_cc(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: state.profile_arn.clone(),
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -1336,6 +1358,7 @@ pub async fn post_messages_cc(
 ///
 /// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
 /// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1385,6 +1408,7 @@ fn create_buffered_sse_stream(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
+    let deadline = Instant::now() + Duration::from_secs(300);
 
     stream::unfold(
         (
@@ -1392,10 +1416,11 @@ fn create_buffered_sse_stream(
             ctx,
             EventStreamDecoder::new(),
             false,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            interval_at(Instant::now() + Duration::from_secs(PING_INTERVAL_SECS), Duration::from_secs(PING_INTERVAL_SECS)),
+            deadline,
             permit,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, permit)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, deadline, permit)| async move {
             if finished {
                 drop(permit);
                 return None;
@@ -1407,11 +1432,25 @@ fn create_buffered_sse_stream(
                     // 避免在上游 chunk 密集时 ping 被"饿死"
                     biased;
 
+                    // 全局 deadline：防止上游挂起导致请求永不结束
+                    _ = tokio::time::sleep_until(deadline) => {
+                        tracing::error!("缓冲模式全局超时（5分钟），强制终止");
+                        let err_event = SseEvent::new("error", serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": "overloaded_error",
+                                "message": "Upstream response timed out (buffered mode, 5min deadline)"
+                            }
+                        }));
+                        let bytes = vec![Ok(Bytes::from(err_event.to_sse_string()))];
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, deadline, permit)));
+                    }
+
                     // 优先检查 ping 保活（等待期间唯一发送的数据）
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, permit)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, deadline, permit)));
                     }
 
                     // 然后处理数据流
@@ -1446,7 +1485,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, permit)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, deadline, permit)));
                             }
                             None => {
                                 // 流结束。先检测上游空响应（与流式路径一致），
@@ -1459,7 +1498,7 @@ fn create_buffered_sse_stream(
                                     );
                                     let err_event = empty_response_error_event(oversized);
                                     let bytes = vec![Ok(Bytes::from(err_event.to_sse_string()))];
-                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, permit)));
+                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, deadline, permit)));
                                 }
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
@@ -1467,7 +1506,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, permit)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, deadline, permit)));
                             }
                         }
                     }
@@ -1476,4 +1515,58 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find_by_id(id: &str) -> Option<Model> {
+        build_model_list().into_iter().find(|m| m.id == id)
+    }
+
+    #[test]
+    fn test_opus_4_6_max_tokens_is_128k() {
+        let m = find_by_id("claude-opus-4-6").expect("claude-opus-4-6 缺失");
+        assert_eq!(m.max_tokens, 128000);
+        let mt = find_by_id("claude-opus-4-6-thinking").expect("claude-opus-4-6-thinking 缺失");
+        assert_eq!(mt.max_tokens, 128000);
+    }
+
+    #[test]
+    fn test_fable_5_present() {
+        let m = find_by_id("claude-fable-5").expect("claude-fable-5 应存在");
+        assert_eq!(m.max_tokens, 128000);
+        assert_eq!(m.owned_by, "anthropic");
+        assert_eq!(m.object, "model");
+        assert_eq!(m.model_type, "chat");
+        assert_eq!(m.display_name, "Claude Fable 5");
+    }
+
+    #[test]
+    fn test_fable_5_thinking_present() {
+        let m = find_by_id("claude-fable-5-thinking").expect("claude-fable-5-thinking 应存在");
+        assert_eq!(m.max_tokens, 128000);
+        assert_eq!(m.display_name, "Claude Fable 5 (Thinking)");
+    }
+
+    #[test]
+    fn test_haiku_4_5_max_tokens_unchanged() {
+        // 回归：haiku-4-5 max_tokens 维持 64000
+        let m = find_by_id("claude-haiku-4-5-20251001").expect("haiku 条目缺失");
+        assert_eq!(m.max_tokens, 64000);
+    }
+
+    #[test]
+    fn test_opus_4_7_4_8_max_tokens_unchanged() {
+        // 回归
+        assert_eq!(find_by_id("claude-opus-4-7").unwrap().max_tokens, 128000);
+        assert_eq!(find_by_id("claude-opus-4-8").unwrap().max_tokens, 128000);
+    }
+
+    #[test]
+    fn test_sonnet_4_6_max_tokens_unchanged() {
+        // 回归
+        assert_eq!(find_by_id("claude-sonnet-4-6").unwrap().max_tokens, 64000);
+    }
 }

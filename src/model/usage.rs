@@ -9,7 +9,9 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// 单条用量记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,12 @@ pub struct UsageRecord {
     /// 真实 credits 消耗（来自 meteringEvent，None 表示旧数据）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credits_used: Option<f64>,
+    /// 缓存命中的输入 token 数（来自 meteringEvent 或反推，None 表示旧数据）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<i32>,
+    /// 缓存创建的输入 token 数（来自 meteringEvent，None 表示旧数据）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<i32>,
     /// 记录时间
     pub created_at: DateTime<Utc>,
     /// 客户端 IP（None 表示旧数据或未知）
@@ -130,8 +138,9 @@ const MAX_RECORDS_PER_KEY: usize = 10_000;
 
 /// 用量追踪器（线程安全）
 pub struct UsageTracker {
-    records: RwLock<Vec<UsageRecord>>,
-    file_path: PathBuf,
+    records: Arc<RwLock<Vec<UsageRecord>>>,
+
+    dirty_tx: mpsc::UnboundedSender<()>,
 }
 impl UsageTracker {
     /// 从文件加载，文件不存在则创建空列表
@@ -147,24 +156,70 @@ impl UsageTracker {
         } else {
             Vec::new()
         };
+        let records = Arc::new(RwLock::new(records));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let records_clone = records.clone();
+        let path_clone = path.clone();
+
+        // 启动后台异步写入任务，避免同步文件写阻塞请求线程
+        tokio::spawn(async move {
+            let mut dirty = false;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    res = rx.recv() => {
+                        match res {
+                            Some(_) => dirty = true,
+                            None => {
+                                // 通道已关闭（系统退出），执行 Graceful Shutdown 刷盘
+                                if dirty
+                                    && let Err(e) = Self::save_internal(&records_clone, &path_clone).await {
+                                        tracing::error!("Graceful shutdown usage save failed: {}", e);
+                                    }
+                                break;
+                            }
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if dirty {
+                            if let Err(e) = Self::save_internal(&records_clone, &path_clone).await {
+                                tracing::error!("Failed to save usage: {}", e);
+                            } else {
+                                dirty = false;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         Ok(Self {
-            records: RwLock::new(records),
-            file_path: path,
+            records,
+
+            dirty_tx: tx,
         })
     }
 
-    /// 持久化到文件
-    fn save(&self) -> anyhow::Result<()> {
-        let records = self.records.read();
-        let content = serde_json::to_string(&*records)?;
-        if let Some(parent) = self.file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&self.file_path, content)?;
+    /// 内部真正的异步落地方法
+    async fn save_internal(records: &Arc<RwLock<Vec<UsageRecord>>>, file_path: &Path) -> anyhow::Result<()> {
+        let content = {
+            let r = records.read();
+            serde_json::to_string(&*r)?
+        };
+        let path = file_path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, content)?;
+            Ok(())
+        })
+        .await??;
         Ok(())
     }
 
     /// 记录一次请求用量
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
         api_key_id: u32,
@@ -174,6 +229,8 @@ impl UsageTracker {
         output_tokens: i32,
         client_ip: Option<String>,
         credits_used: Option<f64>,
+        cache_read_input_tokens: Option<i32>,
+        cache_creation_input_tokens: Option<i32>,
     ) {
         let cost = calculate_cost(&model, input_tokens, output_tokens);
         let record = UsageRecord {
@@ -184,6 +241,8 @@ impl UsageTracker {
             output_tokens,
             estimated_cost: cost,
             credits_used,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
             created_at: Utc::now(),
             client_ip,
         };
@@ -223,9 +282,7 @@ impl UsageTracker {
                 }
             }
         }
-        if let Err(e) = self.save() {
-            tracing::warn!("保存用量记录失败: {}", e);
-        }
+        let _ = self.dirty_tx.send(());
     }
     /// 获取单个 API Key 的用量汇总
     pub fn get_summary(&self, api_key_id: u32) -> UsageSummary {
@@ -285,7 +342,8 @@ impl UsageTracker {
         let mut records = self.records.write();
         records.retain(|r| r.api_key_id != api_key_id);
         drop(records);
-        self.save()
+        let _ = self.dirty_tx.send(());
+        Ok(())
     }
 
     /// 获取指定 API Key 的累计费用（轻量版，仅算总费用）
@@ -341,9 +399,9 @@ impl UsageTracker {
 
         // 锁已释放，在锁外排序
         let mut sorted = owned;
-        sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
-        let total_pages = (total + page_size - 1) / page_size;
+        let total_pages = total.div_ceil(page_size);
         let page = page.max(1).min(total_pages);
         let start = (page - 1) * page_size;
 
@@ -361,6 +419,8 @@ impl UsageTracker {
                     estimated_cost: r.estimated_cost,
                     credits_used: r.credits_used,
                     credits_saved,
+                    cache_read_input_tokens: r.cache_read_input_tokens,
+                    cache_creation_input_tokens: r.cache_creation_input_tokens,
                     created_at: r.created_at,
                     credential_id: r.credential_id,
                     credential_label,
@@ -401,6 +461,12 @@ pub struct UsageRecordItem {
     /// 真实 credits 消耗（来自 meteringEvent，None 表示旧数据）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credits_used: Option<f64>,
+    /// 缓存命中的输入 token 数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<i32>,
+    /// 缓存创建的输入 token 数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<i32>,
     /// 节省的 credits（与无缓存对比）= estimated_cost * get_k_ref(model) - credits_used
     /// 仅当 credits_used 有值时才有值
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -457,9 +523,9 @@ impl UsageTracker {
         }
 
         let mut sorted = owned;
-        sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
-        let total_pages = (total + page_size - 1) / page_size;
+        let total_pages = total.div_ceil(page_size);
         let page = page.max(1).min(total_pages);
         let start = (page - 1) * page_size;
 
@@ -477,6 +543,8 @@ impl UsageTracker {
                     estimated_cost: r.estimated_cost,
                     credits_used: r.credits_used,
                     credits_saved,
+                    cache_read_input_tokens: r.cache_read_input_tokens,
+                    cache_creation_input_tokens: r.cache_creation_input_tokens,
                     created_at: r.created_at,
                     credential_id: r.credential_id,
                     credential_label,
@@ -547,7 +615,7 @@ impl UsageTracker {
         credential_labels: &std::collections::HashMap<u64, String>,
     ) -> UsageRecordsPage {
         const MAX_TOTAL: usize = 2000;
-        let page_size = page_size.min(500).max(1);
+        let page_size = page_size.clamp(1, 500);
         let cst = FixedOffset::east_opt(8 * 3600).unwrap();
 
         let owned: Vec<UsageRecord> = {
@@ -560,7 +628,7 @@ impl UsageTracker {
         };
 
         let mut sorted = owned;
-        sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         sorted.truncate(MAX_TOTAL);
 
         let total = sorted.len();
@@ -574,7 +642,7 @@ impl UsageTracker {
             };
         }
 
-        let total_pages = (total + page_size - 1) / page_size;
+        let total_pages = total.div_ceil(page_size);
         let page = page.max(1).min(total_pages);
         let start = (page - 1) * page_size;
 
@@ -594,6 +662,8 @@ impl UsageTracker {
                     estimated_cost: r.estimated_cost,
                     credits_used: r.credits_used,
                     credits_saved,
+                    cache_read_input_tokens: r.cache_read_input_tokens,
+                    cache_creation_input_tokens: r.cache_creation_input_tokens,
                     created_at: r.created_at,
                     credential_id: r.credential_id,
                     credential_label,

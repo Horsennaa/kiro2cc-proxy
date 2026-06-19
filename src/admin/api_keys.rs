@@ -21,9 +21,11 @@ pub async fn get_server_info(State(state): State<AdminState>) -> impl IntoRespon
     #[serde(rename_all = "camelCase")]
     struct ServerInfo {
         master_api_key: Option<String>,
+        version: String,
     }
     Json(ServerInfo {
         master_api_key: state.master_api_key.as_ref().map(|k| k.read().clone()),
+        version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
 
@@ -185,13 +187,27 @@ pub async fn get_credential_usage_records(
 }
 
 /// GET /api/admin/rpm
-/// 获取实时 RPM 数据
+/// 获取实时 RPM 数据（含 sticky cache 命中/未命中统计）
 pub async fn get_rpm(State(state): State<AdminState>) -> impl IntoResponse {
     let Some(rpm_tracker) = &state.rpm_tracker else {
         let error = AdminErrorResponse::internal_error("RPM 监控未启用");
         return (StatusCode::SERVICE_UNAVAILABLE, Json(error)).into_response();
     };
-    Json(rpm_tracker.snapshot()).into_response()
+    let (sticky_hits, sticky_misses) = state.service.sticky_metrics();
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RpmAndCacheSnapshot {
+        #[serde(flatten)]
+        rpm: crate::model::rpm::RpmSnapshot,
+        sticky_hits: u64,
+        sticky_misses: u64,
+    }
+    Json(RpmAndCacheSnapshot {
+        rpm: rpm_tracker.snapshot(),
+        sticky_hits,
+        sticky_misses,
+    })
+    .into_response()
 }
 
 /// GET /api/admin/usage/daily
@@ -219,4 +235,36 @@ pub async fn get_daily_usage_records(
     let page_size = params.get("page_size").and_then(|v| v.parse::<usize>().ok()).unwrap_or(50);
     let labels = state.service.credential_labels();
     Json(tracker.get_records_paged_by_date(&date, page, page_size, &labels)).into_response()
+}
+
+/// GET /api/admin/credentials/:id/failure-logs?page=1&page_size=50
+/// 分页获取指定账号的失败日志
+pub async fn get_failure_logs(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(store) = &state.failure_log_store else {
+        let error = AdminErrorResponse::internal_error("失败日志未启用");
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(error)).into_response();
+    };
+    let page = params.get("page").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+    let page_size = params.get("page_size").and_then(|v| v.parse::<usize>().ok()).unwrap_or(50).min(500);
+    Json(store.get_paged(id, page, page_size)).into_response()
+}
+
+/// GET /api/admin/credentials/:id/throttle-logs?page=1&page_size=50
+/// 分页获取指定账号的限流日志
+pub async fn get_throttle_logs(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(store) = &state.throttle_log_store else {
+        let error = AdminErrorResponse::internal_error("限流日志未启用");
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(error)).into_response();
+    };
+    let page = params.get("page").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+    let page_size = params.get("page_size").and_then(|v| v.parse::<usize>().ok()).unwrap_or(50).min(500);
+    Json(store.get_paged(id, page, page_size)).into_response()
 }

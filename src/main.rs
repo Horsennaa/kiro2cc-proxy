@@ -6,6 +6,7 @@ mod cache;
 mod common;
 mod http_client;
 mod kiro;
+mod log_capture;
 mod model;
 pub mod token;
 mod user;
@@ -20,6 +21,8 @@ use kiro::token_manager::MultiTokenManager;
 use model::api_key::ApiKeyManager;
 use model::arg::Args;
 use model::config::Config;
+use model::failure_log::FailureLogStore;
+use model::throttle_log::ThrottleLogStore;
 use model::usage::UsageTracker;
 
 #[tokio::main]
@@ -27,20 +30,36 @@ async fn main() {
     // 解析命令行参数
     let args = Args::parse();
 
-    // 初始化日志：默认纯文本；设 KIRO_LOG_JSON=1 切换为 JSON 行（便于 jq 解析并发埋点）
-    let log_json = std::env::var("KIRO_LOG_JSON")
-        .ok()
-        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE"))
-        .unwrap_or(false);
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    if log_json {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(env_filter)
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    // 初始化日志捕获器（在 tracing 初始化之前创建）
+    let log_capture = std::sync::Arc::new(log_capture::LogCapture::new(1000));
+
+    // 初始化日志：默认纯文本；设 KIRO_LOG_JSON=1 切换为 JSON 行（便于 jq 解析并发埋点）。
+    // 同时接入 LogCapture layer（供 admin 失败日志 UI 查看）。
+    {
+        use tracing_subscriber::prelude::*;
+        let log_json = std::env::var("KIRO_LOG_JSON")
+            .ok()
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE"))
+            .unwrap_or(false);
+        let make_filter = || {
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        };
+        let registry = tracing_subscriber::registry()
+            .with(log_capture.as_layer().with_filter(make_filter()));
+        if log_json {
+            registry
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_filter(make_filter()),
+                )
+                .init();
+        } else {
+            registry
+                .with(tracing_subscriber::fmt::layer().with_filter(make_filter()))
+                .init();
+        }
     }
 
     // 加载配置
@@ -110,11 +129,54 @@ async fn main() {
     });
     let token_manager = Arc::new(token_manager);
 
+    // P2：配额感知选号开启时，启动后台配额刷新任务（每 5 分钟刷一轮所有活跃账号）。
+    // 默认关闭；单账号场景不必开，避免额外压力。
+    if config.quota_aware_selection {
+        let tm = token_manager.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                ticker.tick().await;
+                for id in tm.active_credential_ids() {
+                    if let Err(e) = tm.get_usage_limits_for(id).await {
+                        tracing::warn!("配额刷新失败 cred={}: {}", id, e);
+                    }
+                    // 账号间间隔，避免瞬时打上游
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        });
+        tracing::info!("配额感知选号已启用，后台配额刷新任务已启动（5min/轮）");
+    }
+
     // 创建 RPM 追踪器
     let rpm_tracker = Arc::new(model::rpm::RpmTracker::new());
 
+    // 加载限流日志存储
+    let throttle_data_dir = std::path::Path::new(&config_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let throttle_log_store = Arc::new(
+        ThrottleLogStore::load(throttle_data_dir.join("throttle_log.json"))
+            .unwrap_or_else(|e| {
+                tracing::warn!("加载限流日志失败（将使用空日志）: {}", e);
+                ThrottleLogStore::empty(throttle_data_dir.join("throttle_log.json"))
+            }),
+    );
+
+    let failure_log_store = Arc::new(
+        FailureLogStore::load(throttle_data_dir.join("failure_log.json"))
+            .unwrap_or_else(|e| {
+                tracing::warn!("加载失败日志失败（将使用空日志）: {}", e);
+                FailureLogStore::empty(throttle_data_dir.join("failure_log.json"))
+            }),
+    );
+    tracing::info!("failure_log_store 已启用: {:?}", throttle_data_dir.join("failure_log.json"));
+
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone())
-        .with_rpm_tracker(rpm_tracker.clone());
+        .with_rpm_tracker(rpm_tracker.clone())
+        .with_throttle_log_store(throttle_log_store.clone())
+        .with_failure_log_store(failure_log_store.clone());
 
     // 在 provider 被移动进 anthropic 路由前，取出并发监控句柄（可克隆，共享信号量）
     let concurrency_monitor = kiro_provider.concurrency_monitor();
@@ -195,6 +257,9 @@ async fn main() {
             if let Some(ref tracker) = usage_tracker {
                 admin_state = admin_state.with_usage_tracker(tracker.clone());
             }
+            admin_state = admin_state.with_throttle_log_store(throttle_log_store.clone());
+            admin_state = admin_state.with_failure_log_store(failure_log_store.clone());
+            admin_state = admin_state.with_log_capture(log_capture.clone());
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由

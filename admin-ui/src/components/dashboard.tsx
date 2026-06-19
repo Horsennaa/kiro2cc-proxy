@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Harllan He. Licensed under MIT.
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Key, Settings, BarChart2 } from 'lucide-react'
+import { RefreshCw, LogOut, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Key, Settings, BarChart2, ScrollText } from 'lucide-react'
 import kiroIcon from '@/assets/kiro-icon.png'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -17,8 +17,11 @@ import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-
 import { ApiKeysPanel } from '@/components/api-keys-panel'
 import { ApiKeyDetailPage } from '@/components/api-key-detail-page'
 import { CredentialDetailPage } from '@/components/credential-detail-page'
+import { ThrottleLogPage } from '@/components/throttle-log-page'
+import { FailureLogPage } from '@/components/failure-log-page'
 import { SettingsPanel } from '@/components/settings-panel'
-import { useCredentials, useDeleteCredential, useResetFailure, useRpm, useDailyUsage } from '@/hooks/use-credentials'
+import { LogViewerPage } from '@/components/log-viewer-page'
+import { useCredentials, useDeleteCredential, useResetFailure, useRpm, useDailyUsage, useServerInfo } from '@/hooks/use-credentials'
 import { DailyStatsPage } from '@/components/daily-stats-page'
 import { DailyDetailPage } from '@/components/daily-detail-page'
 import { getCredentialBalance } from '@/api/credentials'
@@ -30,9 +33,11 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
-  const [activeTab, setActiveTab] = useState<'credentials' | 'apikeys' | 'settings'>('credentials')
+  const [activeTab, setActiveTab] = useState<'credentials' | 'apikeys' | 'settings' | 'logs'>('credentials')
   const [detailKeyId, setDetailKeyId] = useState<number | null>(null)
   const [detailCredentialId, setDetailCredentialId] = useState<number | null>(null)
+  const [throttleLogCredentialId, setThrottleLogCredentialId] = useState<number | null>(null)
+  const [failureLogCredentialId, setFailureLogCredentialId] = useState<number | null>(null)
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -50,8 +55,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [liveCreditsTotal, setLiveCreditsTotal] = useState<number | null>(null)
   const [liveCreditsQueried, setLiveCreditsQueried] = useState(0)
   const [dailyView, setDailyView] = useState<string | null>(null)
+  const [dailyFromSidebar, setDailyFromSidebar] = useState(false)
   const cancelVerifyRef = useRef(false)
-  const prevTabRef = useRef<'credentials' | 'apikeys' | 'settings' | null>(null)
+  const prevTabRef = useRef<'credentials' | 'apikeys' | 'settings' | 'logs' | null>(null)
   const prevDetailCredentialId = useRef<number | null>(null)
   const prevDailyView = useRef<string | null>(null)
   const initialBalanceFetchDone = useRef(false)
@@ -59,6 +65,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const itemsPerPage = 12
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
+  const { data: serverInfo } = useServerInfo()
   const credentialsRef = useRef(data?.credentials)
   const { data: rpmData } = useRpm()
   const { mutate: deleteCredential } = useDeleteCredential()
@@ -592,7 +599,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             {[
               { label: '账号管理', icon: <Server className="w-4 h-4 shrink-0" />, active: activeTab === 'credentials' && dailyView === null, onClick: () => { setActiveTab('credentials'); setDetailKeyId(null); setDetailCredentialId(null); setDailyView(null) } },
               { label: 'API Keys', icon: <Key className="w-4 h-4 shrink-0" />, active: activeTab === 'apikeys', onClick: () => { setActiveTab('apikeys'); setDetailKeyId(null); setDetailCredentialId(null); setDailyView(null) } },
-              { label: '每日统计', icon: <BarChart2 className="w-4 h-4 shrink-0" />, active: dailyView !== null, onClick: () => { setActiveTab('credentials'); setDetailKeyId(null); setDetailCredentialId(null); setDailyView('list') } },
+              { label: '每日统计', icon: <BarChart2 className="w-4 h-4 shrink-0" />, active: dailyView !== null, onClick: () => { setActiveTab('credentials'); setDetailKeyId(null); setDetailCredentialId(null); setDailyView('list'); setDailyFromSidebar(true) } },
             ].map(({ label, icon, active, onClick }) => (
               <button key={label} onClick={onClick}
                 className={`flex w-full items-center gap-2.5 px-3 py-2 text-[13px] font-medium rounded-md transition-all mb-0.5 ${active ? 'text-foreground bg-secondary' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
@@ -605,6 +612,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <div>
             <div className="text-[10px] uppercase tracking-[.08em] text-muted-foreground/70 px-3 pb-1.5 font-semibold">系统</div>
             <button
+              onClick={() => { setActiveTab('logs'); setDetailKeyId(null); setDetailCredentialId(null); setDailyView(null) }}
+              className={`flex w-full items-center gap-2.5 px-3 py-2 text-[13px] font-medium rounded-md transition-all mb-0.5 ${activeTab === 'logs' ? 'text-foreground bg-secondary' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
+              style={activeTab === 'logs' ? { boxShadow: 'inset 2px 0 0 hsl(var(--primary))' } : undefined}
+            >
+              <ScrollText className="w-4 h-4 shrink-0" />
+              <span>查看日志</span>
+            </button>
+            <button
               onClick={() => { setActiveTab('settings'); setDetailKeyId(null); setDetailCredentialId(null); setDailyView(null) }}
               className={`flex w-full items-center gap-2.5 px-3 py-2 text-[13px] font-medium rounded-md transition-all mb-0.5 ${activeTab === 'settings' ? 'text-foreground bg-secondary' : 'text-muted-foreground hover:text-foreground hover:bg-secondary'}`}
               style={activeTab === 'settings' ? { boxShadow: 'inset 2px 0 0 hsl(var(--primary))' } : undefined}
@@ -615,7 +630,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </div>
         </nav>
         <div className="px-[18px] py-3 border-t border-border flex items-center justify-between">
-          <span className="text-[11px] font-mono text-muted-foreground/50">kiro2cc-proxy</span>
+          <span className="text-[11px] font-mono text-muted-foreground/50">kiro2cc-proxy v{serverInfo?.version ?? '...'}</span>
           <div className="flex items-center gap-1">
             <Button variant="ghost" size="icon" className="h-7 w-7" onClick={handleRefresh} title="刷新">
               <RefreshCw className="h-3.5 w-3.5" />
@@ -629,7 +644,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="ml-[232px] flex-1 min-h-screen px-9 py-7">
-        {activeTab === 'settings' ? (
+        {activeTab === 'logs' ? (
+          <LogViewerPage />
+        ) : activeTab === 'settings' ? (
           <SettingsPanel />
         ) : activeTab === 'apikeys' ? (
           detailKeyId !== null ? (
@@ -642,6 +659,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           )
         ) : dailyView === 'list' ? (
           <DailyStatsPage
+            showBack={!dailyFromSidebar}
             onBack={() => setDailyView(null)}
             onViewDay={(date) => setDailyView(date)}
           />
@@ -649,6 +667,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <DailyDetailPage
             date={dailyView}
             onBack={() => setDailyView('list')}
+          />
+        ) : failureLogCredentialId !== null ? (
+          <FailureLogPage
+            credentialId={failureLogCredentialId}
+            onBack={() => setFailureLogCredentialId(null)}
+          />
+        ) : throttleLogCredentialId !== null ? (
+          <ThrottleLogPage
+            credentialId={throttleLogCredentialId}
+            onBack={() => setThrottleLogCredentialId(null)}
           />
         ) : detailCredentialId !== null ? (
           <CredentialDetailPage
@@ -665,7 +693,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </div>
         </div>
         {/* 统计卡片 */}
-        <div className="grid gap-4 grid-cols-2 md:grid-cols-5 mb-6">
+        <div className="grid gap-4 grid-cols-2 md:grid-cols-4 mb-6">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -715,7 +743,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </Card>
           <Card
             className="cursor-pointer hover:border-primary/50 transition-colors"
-            onClick={() => setDailyView('list')}
+            onClick={() => { setDailyView('list'); setDailyFromSidebar(false) }}
           >
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -735,16 +763,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
               ) : (
                 <div className="text-2xl font-bold text-muted-foreground">—</div>
               )}
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                全局 RPM
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-blue-600">{rpmData?.global ?? '-'}</div>
             </CardContent>
           </Card>
         </div>
@@ -844,6 +862,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     credential={credential}
                     onViewBalance={handleViewBalance}
                     onViewDetail={(id) => setDetailCredentialId(id)}
+                    onViewThrottleLog={(id) => setThrottleLogCredentialId(id)}
+                    onViewFailureLog={(id) => setFailureLogCredentialId(id)}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}

@@ -7,85 +7,13 @@ use std::env;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum TlsBackend {
+    #[default]
     Rustls,
     NativeTls,
 }
 
-impl Default for TlsBackend {
-    fn default() -> Self {
-        Self::Rustls
-    }
-}
-
-/// RPM 限流配置（per-account 主闸门 + global 兜底）
-///
-/// 在选号阶段生效：账号当前 60s 窗口 RPM 达到阈值时被跳过，
-/// 切换到下一个未达阈值的账号；全部达阈值则触发对客户端的退避，
-/// 避免继续往 AWS 灌请求触发 429（降低封号风险）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RateLimitConfig {
-    /// 是否启用 RPM 限流（默认启用）
-    #[serde(default = "default_rate_limit_enabled")]
-    pub enabled: bool,
-
-    /// 全局 RPM 兜底上限（所有账号之和）。0 表示不限制。
-    #[serde(default = "default_global_rpm")]
-    pub global_rpm: u64,
-
-    /// 按账号类型（auth_method）配置的单账号 RPM 上限。
-    /// key 用规范化后的 auth_method（如 social / external_idp / idc），
-    /// 特殊 key "default" 作为未匹配类型的回落值。0 表示该类型不限制。
-    #[serde(default = "default_per_type")]
-    pub per_type: std::collections::HashMap<String, u64>,
-
-    /// 按账号 ID 覆盖单账号 RPM 上限（优先级高于 per_type）。
-    #[serde(default)]
-    pub per_account_override: std::collections::HashMap<u64, u64>,
-}
-
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_rate_limit_enabled(),
-            global_rpm: default_global_rpm(),
-            per_type: default_per_type(),
-            per_account_override: std::collections::HashMap::new(),
-        }
-    }
-}
-
-impl RateLimitConfig {
-    /// 解析某账号（按类型 + id 覆盖）的单账号 RPM 上限。返回 0 表示不限制。
-    pub fn limit_for(&self, auth_method: Option<&str>, credential_id: u64) -> u64 {
-        if let Some(&v) = self.per_account_override.get(&credential_id) {
-            return v;
-        }
-        let key = auth_method.unwrap_or("default").to_lowercase();
-        if let Some(&v) = self.per_type.get(&key) {
-            return v;
-        }
-        self.per_type.get("default").copied().unwrap_or(0)
-    }
-}
-
-fn default_rate_limit_enabled() -> bool {
-    true
-}
-
-fn default_global_rpm() -> u64 {
-    30
-}
-
-fn default_per_type() -> std::collections::HashMap<String, u64> {
-    let mut m = std::collections::HashMap::new();
-    m.insert("social".to_string(), 8);
-    m.insert("external_idp".to_string(), 6);
-    m.insert("idc".to_string(), 6);
-    m.insert("default".to_string(), 6);
-    m
-}
 
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,9 +89,14 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
-    /// RPM 限流配置（per-account 主闸门 + global 兜底）
+    /// 单账号每分钟最大请求数（超出时排队等待），0 表示不限制
+    #[serde(default = "default_max_rpm_per_credential")]
+    pub max_rpm_per_credential: u32,
+
+    /// 是否启用配额感知选号：同优先级内偏好余量高的账号，主动避开余量耗尽的账号。
+    /// 默认关闭（单账号场景无意义，多账号时手动开启）。
     #[serde(default)]
-    pub rate_limit: RateLimitConfig,
+    pub quota_aware_selection: bool,
 
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
@@ -183,12 +116,17 @@ fn default_region() -> String {
 }
 
 fn default_kiro_version() -> String {
-    "0.10.0".to_string()
+    "2.2.2".to_string()
+}
+
+fn default_max_rpm_per_credential() -> u32 {
+    // 0 = 不限制。生产已明确取消单账号 RPM 限速（单账号场景限速=自残），
+    // 需要时在 config.json 显式设 max_rpm_per_credential。
+    0
 }
 
 fn default_system_version() -> String {
-    const SYSTEM_VERSIONS: &[&str] = &["darwin#24.6.0", "win32#10.0.22631"];
-    SYSTEM_VERSIONS[fastrand::usize(..SYSTEM_VERSIONS.len())].to_string()
+    "darwin#24.6.0".to_string()
 }
 
 fn default_node_version() -> String {
@@ -229,7 +167,8 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
-            rate_limit: RateLimitConfig::default(),
+            max_rpm_per_credential: default_max_rpm_per_credential(),
+            quota_aware_selection: false,
             config_path: None,
         }
     }
@@ -257,10 +196,10 @@ impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
-            // 配置文件不存在，返回默认配置
-            let mut config = Self::default();
-            config.config_path = Some(path.to_path_buf());
-            return Ok(config);
+            return Ok(Self {
+                config_path: Some(path.to_path_buf()),
+                ..Self::default()
+            });
         }
 
         let content = fs::read_to_string(path)?;
@@ -308,11 +247,10 @@ impl Config {
         if let Ok(v) = env::var("HOST") {
             self.host = v;
         }
-        if let Ok(v) = env::var("PORT") {
-            if let Ok(p) = v.parse::<u16>() {
+        if let Ok(v) = env::var("PORT")
+            && let Ok(p) = v.parse::<u16>() {
                 self.port = p;
             }
-        }
         if let Ok(v) = env::var("REGION") {
             self.region = v;
         }

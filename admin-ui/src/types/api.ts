@@ -168,6 +168,8 @@ export interface UsageRecord {
   estimatedCost: number
   creditsUsed?: number
   creditsSaved?: number
+  cacheReadInputTokens?: number
+  cacheCreationInputTokens?: number
   createdAt: string
   credentialId?: number
   credentialLabel?: string
@@ -190,4 +192,40 @@ export interface DailySummary {
   totalCost: number
   totalCredits: number
   totalCreditsSaved?: number
+}
+
+// 单条限流日志记录
+export interface ThrottleLogRecord {
+  credentialId: number
+  requestType: string
+  statusCode: number
+  responseBody: string
+  createdAt: string
+}
+
+// 限流日志分页响应
+export interface ThrottleLogsResponse {
+  records: ThrottleLogRecord[]
+  total: number
+  page: number
+  pageSize: number
+  totalPages: number
+}
+
+// 单条失败日志记录
+export interface FailureLogRecord {
+  credentialId: number
+  requestType: string
+  statusCode: number
+  responseBody: string
+  createdAt: string
+}
+
+// 失败日志分页响应
+export interface FailureLogsResponse {
+  records: FailureLogRecord[]
+  total: number
+  page: number
+  pageSize: number
+  totalPages: number
 }

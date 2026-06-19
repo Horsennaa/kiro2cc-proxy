@@ -159,12 +159,6 @@ impl UserInputMessageContext {
         Self::default()
     }
 
-    /// 设置工具列表
-    pub fn with_tools(mut self, tools: Vec<Tool>) -> Self {
-        self.tools = tools;
-        self
-    }
-
     /// 设置工具结果
     pub fn with_tool_results(mut self, results: Vec<ToolResult>) -> Self {
         self.tool_results = results;
@@ -322,6 +316,9 @@ impl HistoryAssistantMessage {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {
+    /// 消息 ID（确定性生成，保证同一历史条目跨请求稳定，利于上游 prompt cache）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     /// 响应内容
     pub content: String,
     /// 工具使用列表
@@ -333,6 +330,7 @@ impl AssistantMessage {
     /// 创建新的助手消息
     pub fn new(content: impl Into<String>) -> Self {
         Self {
+            message_id: None,
             content: content.into(),
             tool_uses: None,
         }

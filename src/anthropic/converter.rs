@@ -7,6 +7,7 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
@@ -143,8 +144,8 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
         None => {}
     }
 
-    if let Some(description) = obj.remove("description") {
-        if let Some(description) = description.as_str() {
+    if let Some(description) = obj.remove("description")
+        && let Some(description) = description.as_str() {
             let description = match description.char_indices().nth(2000) {
                 Some((idx, _)) => description[..idx].to_string(),
                 None => description.to_string(),
@@ -154,10 +155,9 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
                 serde_json::Value::String(description),
             );
         }
-    }
 
-    if let Some(enum_value) = obj.remove("enum") {
-        if let serde_json::Value::Array(values) = enum_value {
+    if let Some(enum_value) = obj.remove("enum")
+        && let serde_json::Value::Array(values) = enum_value {
             let values: Vec<_> = values
                 .into_iter()
                 .filter(|v| v.is_string() || v.is_number() || v.is_boolean())
@@ -166,7 +166,6 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
                 obj.insert("enum".to_string(), serde_json::Value::Array(values));
             }
         }
-    }
 
     obj.retain(|key, _| {
         matches!(
@@ -206,7 +205,104 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-static PREV_H0: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+const SESSION_CACHE_CAPACITY: usize = 1024;
+
+#[derive(Clone)]
+struct CacheEntry<T: Clone> {
+    value: T,
+    last_used: Instant,
+}
+
+impl<T: Clone> CacheEntry<T> {
+    fn new(value: T) -> Self {
+        Self { value, last_used: Instant::now() }
+    }
+}
+
+fn evict_oldest_if_full<T: Clone>(map: &mut HashMap<String, CacheEntry<T>>) {
+    while map.len() > SESSION_CACHE_CAPACITY {
+        // 优化：全局 Mutex 锁内避免 O(N) 扫描，使用 HashMap 迭代器提供的 O(1) 伪随机键进行淘汰
+        let Some(random_key) = map.keys().next().cloned() else {
+            break;
+        };
+        map.remove(&random_key);
+    }
+}
+
+static PREV_H0: OnceLock<Mutex<HashMap<String, CacheEntry<String>>>> = OnceLock::new();
+
+/// 从文本中剥除所有 `<system-reminder>...</system-reminder>` 标签及其内容。
+fn strip_system_reminders(text: &str) -> String {
+    const OPEN_TAG: &str = "<system-reminder>";
+    const CLOSE_TAG: &str = "</system-reminder>";
+
+    let mut result = String::with_capacity(text.len());
+    let mut search_from = 0;
+
+    while let Some(start) = text[search_from..].find(OPEN_TAG) {
+        let abs_start = search_from + start;
+        result.push_str(&text[search_from..abs_start]);
+
+        let after_open = abs_start + OPEN_TAG.len();
+        if let Some(end) = text[after_open..].find(CLOSE_TAG) {
+            search_from = after_open + end + CLOSE_TAG.len();
+        } else {
+            search_from = text.len();
+        }
+    }
+    result.push_str(&text[search_from..]);
+
+    result
+}
+
+/// 从所有 user 消息中提取 `<system-reminder>` 标签内的内容，拼接返回。
+fn extract_system_reminders(messages: &[super::types::Message]) -> String {
+    const OPEN_TAG: &str = "<system-reminder>";
+    const CLOSE_TAG: &str = "</system-reminder>";
+
+    let mut reminders = Vec::new();
+
+    for msg in messages {
+        if msg.role != "user" {
+            continue;
+        }
+        let texts: Vec<String> = match &msg.content {
+            serde_json::Value::String(s) => vec![s.clone()],
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|item| {
+                    let t = item.get("type")?.as_str()?;
+                    if t == "text" {
+                        item.get("text")?.as_str().map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            _ => vec![],
+        };
+
+        for text in &texts {
+            let mut search_from = 0;
+            while let Some(start) = text[search_from..].find(OPEN_TAG) {
+                let after_open = search_from + start + OPEN_TAG.len();
+                if let Some(end) = text[after_open..].find(CLOSE_TAG) {
+                    let content = text[after_open..after_open + end].trim();
+                    if !content.is_empty() {
+                        reminders.push(content.to_string());
+                    }
+                    search_from = after_open + end + CLOSE_TAG.len();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    reminders.sort();
+    reminders.dedup();
+    reminders.join("\n")
+}
 
 /// 将系统提示词中 `x-anthropic-billing-header` 行的 `cch=<value>` 替换为固定值 `0`。
 /// cch 是 Claude Code 每轮注入的计费哈希，对 Kiro 无意义，固定后 history[0] 跨请求稳定，
@@ -218,7 +314,7 @@ fn normalize_billing_header(content: String) -> String {
     };
     let value_start = cch_pos + PREFIX.len();
     let value_end = content[value_start..]
-        .find(|c: char| c == ';' || c == '\n')
+        .find([';', '\n'])
         .map(|i| value_start + i)
         .unwrap_or(content.len());
     let mut result = content;
@@ -243,6 +339,8 @@ pub fn map_model(model: &str) -> Option<String> {
         } else {
             Some("claude-sonnet-4.5".to_string())
         }
+    } else if model_lower.contains("fable") {
+        Some("claude-fable-5".to_string())
     } else if model_lower.contains("opus") {
         if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
@@ -279,6 +377,8 @@ pub fn map_model(model: &str) -> Option<String> {
 pub struct ConversionResult {
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
+    /// 模型专属请求参数（thinking、output_config、max_tokens）
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 
 /// 转换错误
@@ -313,17 +413,15 @@ pub(super) fn is_valid_uuid(s: &str) -> bool {
 /// 2. JSON 格式: {"session_id":"UUID"} 或 {"id":"UUID"}（Claude Code 2.1.128+）
 fn extract_session_id(user_id: &str) -> Option<String> {
     // 尝试 JSON 格式解析（Claude Code 新版本发送 JSON 字符串作为 user_id）
-    if user_id.trim_start().starts_with('{') {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(user_id) {
+    if user_id.trim_start().starts_with('{')
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(user_id) {
             for key in &["session_id", "id"] {
-                if let Some(id) = v.get(key).and_then(|v| v.as_str()) {
-                    if is_valid_uuid(id) {
+                if let Some(id) = v.get(key).and_then(|v| v.as_str())
+                    && is_valid_uuid(id) {
                         return Some(id.to_string());
                     }
-                }
             }
         }
-    }
     // 标准格式: 查找 "session_" 后面的 UUID
     if let Some(pos) = user_id.find("session_") {
         let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
@@ -357,20 +455,61 @@ fn derive_agent_continuation_id(conversation_id: &str) -> String {
     )
 }
 
+/// 为无 metadata 的第三方客户端从 system 文本 + 工具名集合派生稳定的 conversation UUID。
+/// 相同的 system+tools 组合总是产生相同的 UUID，实现 sticky 路由和跨轮次缓存冻结。
+/// 当 system 和 tools 都为空时返回 None（退化为完全随机 UUID）。
+fn derive_fallback_conversation_id(req: &MessagesRequest) -> Option<String> {
+    let system_seed = req
+        .system
+        .as_ref()
+        .map(|s| s.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("\n"))
+        .unwrap_or_default();
+    let mut tool_names: Vec<&str> = req
+        .tools
+        .as_deref()
+        .map(|tools| tools.iter().map(|t| t.name.as_str()).collect())
+        .unwrap_or_default();
+    tool_names.sort_unstable();
+    if system_seed.is_empty() && tool_names.is_empty() {
+        return None;
+    }
+    // 仅取 system 前 4096 字符，避免超长 prompt 导致 hash 计算过慢
+    let system_truncated: &str = match system_seed.char_indices().nth(4096) {
+        Some((idx, _)) => &system_seed[..idx],
+        None => &system_seed,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"fallback-conversation:");
+    hasher.update(system_truncated.as_bytes());
+    hasher.update(b"|tools=");
+    for name in &tool_names {
+        hasher.update(name.as_bytes());
+        hasher.update(b",");
+    }
+    let result = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&result[..16]);
+    // 强制设置 UUID v4 的 Version (4) 和 Variant (8/9/A/B) 位
+    // 确保上游严格的 UUID 解析器不会将其拒绝为非法格式 (400 Bad Request)
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    Some(uuid::Uuid::from_bytes(bytes).to_string())
+}
+
 /// 收集历史消息中使用的所有工具名称
 fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     let mut tool_names = Vec::new();
 
     for msg in history {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+        if let Message::Assistant(assistant_msg) = msg
+            && let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
                 for tool_use in tool_uses {
                     if !tool_names.contains(&tool_use.name) {
                         tool_names.push(tool_use.name.clone());
                     }
                 }
             }
-        }
     }
 
     tool_names
@@ -420,12 +559,16 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     };
 
     // 3. 生成会话 ID 和代理 ID
-    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
+    // 优先级：
+    //   1. metadata.user_id 中的 session UUID（Claude Code 标准格式）
+    //   2. system + 工具名集合的 SHA-256 派生（让无 metadata 的第三方客户端也能 sticky）
+    //   3. 完全随机 UUID（仅当无 system 也无工具时）
     let conversation_id = req
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
+        .or_else(|| derive_fallback_conversation_id(req))
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     // agentContinuationId 基于 conversationId 派生，保持同一会话内稳定
     // 这样 Kiro 后端能识别连续请求，对历史消息做跨请求 prompt caching
@@ -474,10 +617,23 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         }
     }
 
-    // 11. 构建 UserInputMessageContext
+    // 11. [cache-check] 打印 history 条目哈希，便于跨请求验证 prefix cache 稳定性
+    for (i, msg) in history.iter().enumerate() {
+        let json = serde_json::to_string(msg).unwrap_or_default();
+        let hash = format!("{:x}", Sha256::digest(json.as_bytes()));
+        tracing::info!(
+            "[cache-check] session={} history[{}] hash={} len={}",
+            conversation_id,
+            i,
+            &hash[..8],
+            json.len(),
+        );
+    }
+
+    // 11b. 构建 UserInputMessageContext —— tools 完整定义直接写入 context.tools（与 Kiro 官方 CLI 一致）
     let mut context = UserInputMessageContext::new();
     if !tools.is_empty() {
-        context = context.with_tools(tools);
+        context.tools = tools;
     }
     if !validated_tool_results.is_empty() {
         context = context.with_tool_results(validated_tool_results);
@@ -485,9 +641,12 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    // 空 content 兜底：Kiro 后端不接受空字符串，用 "Continue" 占位
+    // 空 content 兜底：Kiro 后端不接受空字符串。
+    // 注意：此前用 "Continue" 会让模型把 tool_result-only 的 user 消息误判为
+    // "用户让我继续" → 仅简短回 "已完成" 不复述工具结果（如 LS 输出）。
+    // 改用中性提示词，明确告知"上方为工具结果"，让模型基于结果回复用户。
     let content = if text_content.is_empty() {
-        "Continue".to_string()
+        "(tool result above)".to_string()
     } else {
         text_content
     };
@@ -513,7 +672,12 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_current_message(current_message)
         .with_history(history);
 
-    Ok(ConversionResult { conversation_state })
+    let additional_model_request_fields = build_additional_model_request_fields(req);
+
+    Ok(ConversionResult {
+        conversation_state,
+        additional_model_request_fields,
+    })
 }
 
 /// 确定聊天触发类型
@@ -522,30 +686,15 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
     "MANUAL".to_string()
 }
 
-/// 典型代码工具名称（用于 spectask 检测）
-const CODE_TOOL_NAMES: &[&str] = &[
-    "read", "write", "edit", "bash", "glob", "grep",
-    "read_file", "write_file", "edit_file", "run_bash",
-    "list_files", "search_files", "create_file", "delete_file",
-    "str_replace_editor", "computer",
-];
-
 /// 确定代理任务类型
 ///
-/// - 若工具列表包含典型代码/文件系统工具 → "spectask"（优化代码生成质量）
-/// - 否则 → "vibe"（优化对话连续性）
+/// - 请求携带任意工具 → "spectask"：触发 Kiro 原生 toolUseEvent 响应
+/// - 无工具 → "vibe"
 fn determine_agent_task_type(req: &MessagesRequest) -> &'static str {
-    let Some(tools) = &req.tools else {
-        return "vibe";
-    };
-    if tools.is_empty() {
-        return "vibe";
+    match &req.tools {
+        Some(tools) if !tools.is_empty() => "spectask",
+        _ => "vibe",
     }
-    let has_code_tool = tools.iter().any(|t| {
-        let name_lower = t.name.to_lowercase();
-        CODE_TOOL_NAMES.iter().any(|&code_tool| name_lower == code_tool)
-    });
-    if has_code_tool { "spectask" } else { "vibe" }
 }
 
 /// 处理消息内容，提取文本、图片和工具结果
@@ -558,7 +707,10 @@ fn process_message_content(
 
     match content {
         serde_json::Value::String(s) => {
-            text_parts.push(s.clone());
+            let stripped = strip_system_reminders(s);
+            if !stripped.trim().is_empty() {
+                text_parts.push(stripped);
+            }
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
@@ -566,19 +718,21 @@ fn process_message_content(
                     match block.block_type.as_str() {
                         "text" => {
                             if let Some(text) = block.text {
-                                text_parts.push(text);
-                            }
-                        }
-                        "image" => {
-                            if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
+                                let stripped = strip_system_reminders(&text);
+                                if !stripped.trim().is_empty() {
+                                    text_parts.push(stripped);
                                 }
                             }
                         }
+                        "image" => {
+                            if let Some(source) = block.source
+                                && let Some(format) = get_image_format(&source.media_type) {
+                                    images.push(KiroImage::from_base64(format, source.data));
+                                }
+                        }
                         "document" => {
-                            if let Some(source) = block.source {
-                                if source.media_type == "application/pdf" {
+                            if let Some(source) = block.source
+                                && source.media_type == "application/pdf" {
                                     match extract_pdf_text_from_base64(&source.data) {
                                         Some(text) if !text.is_empty() => {
                                             text_parts.push(format!(
@@ -594,7 +748,6 @@ fn process_message_content(
                                         }
                                     }
                                 }
-                            }
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
@@ -997,8 +1150,8 @@ fn remove_orphaned_tool_uses(
     }
 
     for msg in history.iter_mut() {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+        if let Message::Assistant(assistant_msg) = msg
+            && let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
                 let original_len = tool_uses.len();
                 tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
 
@@ -1012,7 +1165,6 @@ fn remove_orphaned_tool_uses(
                     );
                 }
             }
-        }
     }
 }
 
@@ -1072,6 +1224,52 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
     }
 
     converted
+}
+
+/// 根据模型返回 Kiro 允许的 max_tokens 上限
+fn model_max_output_tokens(model: &str) -> i32 {
+    if model.contains("opus-4-7") || model.contains("opus-4-8") {
+        128000
+    } else {
+        64000
+    }
+}
+
+/// 构建 additionalModelRequestFields（thinking、output_config、max_tokens）
+fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+
+    if let Some(t) = &req.thinking {
+        let mut thinking_obj = serde_json::Map::new();
+        if t.thinking_type == "enabled" || t.thinking_type == "adaptive" {
+            thinking_obj.insert("type".into(), serde_json::json!("adaptive"));
+        } else {
+            thinking_obj.insert("type".into(), serde_json::json!("disabled"));
+        }
+        fields.insert("thinking".into(), serde_json::Value::Object(thinking_obj));
+    }
+
+    let effort = req
+        .output_config
+        .as_ref()
+        .map(|c| c.effort.as_str())
+        .unwrap_or("high");
+    fields.insert(
+        "output_config".into(),
+        serde_json::json!({ "effort": effort }),
+    );
+
+    if req.max_tokens > 0 {
+        let cap = model_max_output_tokens(&req.model);
+        let capped = req.max_tokens.min(cap);
+        fields.insert("max_tokens".into(), serde_json::json!(capped));
+    }
+
+    if fields.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(fields))
+    }
 }
 
 /// 生成thinking标签前缀
@@ -1146,13 +1344,24 @@ fn build_history(
             // 将 cch= 固定为 0，使 history[0] 跨请求稳定，命中 Kiro prompt cache。
             let final_content = normalize_billing_header(final_content);
 
+            // 从 messages 中提取 <system-reminder> 内容追加到 h[0]，一并冻结
+            let final_content = {
+                let reminders = extract_system_reminders(messages);
+                if reminders.is_empty() {
+                    final_content
+                } else {
+                    format!("{}\n{}", final_content, reminders)
+                }
+            };
+
             // 同一会话复用首轮 history[0]，冻结 cc_version/gitStatus/currentDate 等易变字段，
             // 确保 Kiro 服务端跨轮次缓存命中。首轮写入，后续轮次直接返回首轮内容。
             let final_content = {
                 let cache = PREV_H0.get_or_init(|| Mutex::new(HashMap::new()));
                 let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(prev) = map.get(session_id) {
-                    let frozen = prev.clone();
+                if let Some(entry) = map.get_mut(session_id) {
+                    entry.last_used = Instant::now();
+                    let frozen = entry.value.clone();
                     let h0_hash = {
                         let mut hasher = Sha256::new();
                         hasher.update(frozen.as_bytes());
@@ -1177,7 +1386,8 @@ fn build_history(
                         final_content.len(),
                         session_id
                     );
-                    map.insert(session_id.to_string(), final_content.clone());
+                    map.insert(session_id.to_string(), CacheEntry::new(final_content.clone()));
+                    evict_oldest_if_full(&mut map);
                     final_content
                 }
             };
@@ -1207,9 +1417,7 @@ fn build_history(
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
 
-    for i in 0..history_end_index {
-        let msg = &messages[i];
-
+    for msg in &messages[..history_end_index] {
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
@@ -1268,9 +1476,10 @@ fn merge_user_messages(
     }
 
     let content = content_parts.join("\n");
-    // 空 content 兜底：历史 user 消息中仅含 tool_result 时，Kiro 不接受空字符串
+    // 空 content 兜底：历史 user 消息中仅含 tool_result 时，Kiro 不接受空字符串。
+    // 与 convert_request 保持同样占位词，避免 "Continue" 误导模型。
     let content = if content.is_empty() {
-        "Continue".to_string()
+        "(tool result above)".to_string()
     } else {
         content
     };
@@ -1296,7 +1505,6 @@ fn merge_user_messages(
 fn convert_assistant_message(
     msg: &super::types::Message,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
-    let mut thinking_content = String::new();
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
 
@@ -1308,11 +1516,10 @@ fn convert_assistant_message(
             for item in arr {
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
-                        "thinking" => {
-                            if let Some(thinking) = block.thinking {
-                                thinking_content.push_str(&thinking);
-                            }
-                        }
+                        // 历史消息中剥离 thinking 内容：thinking 仅对当轮推理有意义，
+                        // 保留在 history 中会导致 payload 膨胀（Opus 每轮可产生数万字符），
+                        // 触发 Kiro 400 "Improperly formed request"。
+                        "thinking" => {}
                         "text" => {
                             if let Some(text) = block.text {
                                 text_content.push_str(&text);
@@ -1332,25 +1539,37 @@ fn convert_assistant_message(
         _ => {}
     }
 
-    // 组合 thinking 和 text 内容
-    // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    let final_content = if !thinking_content.is_empty() {
-        if !text_content.is_empty() {
-            format!(
-                "<thinking>{}</thinking>\n\n{}",
-                thinking_content, text_content
-            )
-        } else {
-            format!("<thinking>{}</thinking>", thinking_content)
-        }
-    } else if text_content.is_empty() && !tool_uses.is_empty() {
+    // Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符。
+    // 注意：此处与 user 侧（convert_request / merge_user_messages）的 "(tool result above)"
+    // 策略不同 —— assistant 侧是"模型自己历史的 tool_use 调用"，仅需占位无需语义引导；
+    // 而 user 侧需明示"上方为工具结果"以避免模型误读为"用户让我继续"。
+    let final_content = if text_content.is_empty() && !tool_uses.is_empty() {
         " ".to_string()
     } else {
         text_content
     };
 
-    let mut assistant = AssistantMessage::new(final_content);
+    // 确定性 messageId：基于 content + tool_use IDs 做 SHA-256，保证同一历史条目跨请求稳定
+    let message_id = {
+        let mut seed = String::from("assistant-msg:");
+        seed.push_str(&final_content);
+        for tu in &tool_uses {
+            seed.push(':');
+            seed.push_str(&tu.tool_use_id);
+        }
+        let hash = Sha256::digest(seed.as_bytes());
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+            hash[8], hash[9], hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]
+        )
+    };
+
+    let mut assistant = AssistantMessage {
+        message_id: Some(message_id),
+        content: final_content,
+        tool_uses: None,
+    };
     if !tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(tool_uses);
     }
@@ -1390,7 +1609,26 @@ fn merge_assistant_messages(
         content_parts.join("\n\n")
     };
 
-    let mut assistant = AssistantMessage::new(content);
+    let message_id = {
+        let mut seed = String::from("assistant-msg:");
+        seed.push_str(&content);
+        for tu in &all_tool_uses {
+            seed.push(':');
+            seed.push_str(&tu.tool_use_id);
+        }
+        let hash = Sha256::digest(seed.as_bytes());
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+            hash[8], hash[9], hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]
+        )
+    };
+
+    let mut assistant = AssistantMessage {
+        message_id: Some(message_id),
+        content,
+        tool_uses: None,
+    };
     if !all_tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(all_tool_uses);
     }
@@ -1707,7 +1945,7 @@ mod tests {
             output_config: None,
             metadata: None,
         };
-        assert_eq!(determine_agent_task_type(&req), "vibe");
+        assert_eq!(determine_agent_task_type(&req), "spectask");
     }
 
     #[test]
@@ -2342,7 +2580,8 @@ mod tests {
         let result = merge_assistant_messages(&messages).expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
-        assert!(content.contains("<thinking>"), "应包含 thinking 标签");
+        // thinking 块在 convert_assistant_message 中被有意剥离，不应出现
+        assert!(!content.contains("<thinking>"), "thinking 应被剥离");
         assert!(
             content.contains("Let me read that file"),
             "应包含第二条消息的 text 内容"
@@ -2534,6 +2773,27 @@ mod tests {
             result1.conversation_state.agent_continuation_id,
             result2.conversation_state.agent_continuation_id,
             "无 metadata 时 agentContinuationId 应该随机（每次不同）"
+        );
+    }
+
+    #[test]
+    fn test_map_model_fable_routes_to_kiro_fable() {
+        assert_eq!(
+            map_model("claude-fable-5"),
+            Some("claude-fable-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-fable-5-thinking"),
+            Some("claude-fable-5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_opus_4_6_unchanged() {
+        // 回归：opus-4-6 默认走 claude-opus-4.6
+        assert_eq!(
+            map_model("claude-opus-4-6"),
+            Some("claude-opus-4.6".to_string())
         );
     }
 }

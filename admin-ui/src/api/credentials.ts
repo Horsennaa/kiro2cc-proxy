@@ -17,6 +17,8 @@ import type {
   RpmSnapshot,
   UsageRecordsResponse,
   DailySummary,
+  ThrottleLogsResponse,
+  FailureLogsResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -115,8 +117,8 @@ export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promi
 // ============ 服务器信息 ============
 
 // 获取服务器连接信息
-export async function getServerInfo(): Promise<{ masterApiKey: string | null }> {
-  const { data } = await api.get<{ masterApiKey: string | null }>('/server-info')
+export async function getServerInfo(): Promise<{ masterApiKey: string | null; version: string }> {
+  const { data } = await api.get<{ masterApiKey: string | null; version: string }>('/server-info')
   return data
 }
 
@@ -225,6 +227,34 @@ export async function getDailyUsageRecords(
 ): Promise<UsageRecordsResponse> {
   const { data } = await api.get<UsageRecordsResponse>(
     `/usage/daily/${date}/records`,
+    { params: { page, page_size: pageSize } }
+  )
+  return data
+}
+
+// ============ 失败日志 ============
+
+export async function getFailureLogs(
+  id: number,
+  page: number,
+  pageSize: number
+): Promise<FailureLogsResponse> {
+  const { data } = await api.get<FailureLogsResponse>(
+    `/credentials/${id}/failure-logs`,
+    { params: { page, page_size: pageSize } }
+  )
+  return data
+}
+
+// ============ 限流日志 ============
+
+export async function getThrottleLogs(
+  id: number,
+  page: number,
+  pageSize: number
+): Promise<ThrottleLogsResponse> {
+  const { data } = await api.get<ThrottleLogsResponse>(
+    `/credentials/${id}/throttle-logs`,
     { params: { page, page_size: pageSize } }
   )
   return data

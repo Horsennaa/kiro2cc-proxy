@@ -30,6 +30,8 @@ interface CredentialCardProps {
   credential: CredentialStatusItem
   onViewBalance: (id: number) => void
   onViewDetail: (id: number) => void
+  onViewThrottleLog: (id: number) => void
+  onViewFailureLog: (id: number) => void
   selected: boolean
   onToggleSelect: () => void
   balance: BalanceResponse | null
@@ -77,6 +79,8 @@ export function CredentialCard({
   credential,
   onViewBalance,
   onViewDetail,
+  onViewThrottleLog,
+  onViewFailureLog,
   selected,
   onToggleSelect,
   balance,
@@ -210,11 +214,19 @@ export function CredentialCard({
                       </span>
                     )}
                   </span>
-                  <span className={credential.failureCount > 0 ? 'text-red-500 font-medium' : 'text-muted-foreground'}>
+                  <span
+                    className={`cursor-pointer hover:underline ${credential.failureCount > 0 ? 'text-red-500 font-medium' : 'text-muted-foreground'}`}
+                    onClick={() => onViewFailureLog(credential.id)}
+                    title="查看失败日志"
+                  >
                     失败：{credential.failureCount}
                   </span>
                   <span className="text-muted-foreground">成功：{credential.successCount}</span>
-                  <span className={credential.throttleCount > 0 ? 'text-orange-500 font-medium' : 'text-muted-foreground'}>
+                  <span
+                    className={`cursor-pointer hover:underline ${credential.throttleCount > 0 ? 'text-orange-500 font-medium' : 'text-muted-foreground'}`}
+                    onClick={() => onViewThrottleLog(credential.id)}
+                    title="查看限流日志"
+                  >
                     限流：{credential.throttleCount}
                   </span>
                   <span className="text-blue-600 dark:text-blue-400 font-medium">RPM {rpm}</span>

@@ -559,6 +559,14 @@ struct CredentialEntry {
     throttle_count: u64,
     /// 最后一次被限流时间（内存中，不持久化）
     last_throttled_at: Option<Instant>,
+    /// 最后一次被限流时间（UTC，持久化，用于健康状态窗口计算）
+    last_throttled_wall: Option<DateTime<Utc>>,
+    /// 最后一次 token 刷新时间（用于冷却期控制）
+    last_refreshed_at: Option<Instant>,
+    /// 配额余量缓存（配额感知选号用，None=未知），usage_limit - current_usage，越大越充足
+    quota_remaining: Option<f64>,
+    /// 配额缓存更新时间（内存，不持久化），用于 TTL 判定
+    quota_checked_at: Option<Instant>,
 }
 
 /// 禁用原因
@@ -620,6 +628,8 @@ struct StatsEntry {
     last_used_at: Option<String>,
     #[serde(default)]
     throttle_count: u64,
+    #[serde(default)]
+    last_throttled_wall: Option<String>,
 }
 
 // ============================================================================
@@ -706,10 +716,12 @@ pub struct MultiTokenManager {
     rr_counter: AtomicU64,
     /// Sticky cache：agentContinuationId → 账号绑定关系
     sticky_cache: Mutex<HashMap<String, StickyCacheEntry>>,
+    /// Sticky cache 命中次数（lock-free 统计）
+    sticky_hits: AtomicU64,
+    /// Sticky cache 未命中次数（包括无 continuation_id、TTL 过期、账号不健康）
+    sticky_misses: AtomicU64,
     /// 持久化串行锁：串行化 credentials/stats 的序列化+写盘，避免多路径并发交错写
     persist_lock: Mutex<()>,
-    /// RPM 限流器（per-account 主闸门 + global 兜底，选号时预占）
-    rpm_limiter: crate::kiro::rpm_limiter::RpmLimiter,
 }
 
 /// 每个账号最大 API 调用失败次数
@@ -718,6 +730,8 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// Sticky cache 条目存活时间（60 分钟不活跃后自动淘汰）
 const STICKY_CACHE_TTL: StdDuration = StdDuration::from_secs(60 * 60);
+
+const TOKEN_REFRESH_COOLDOWN: StdDuration = StdDuration::from_secs(30);
 
 /// Sticky cache 条目：记录会话到账号的绑定关系
 struct StickyCacheEntry {
@@ -801,14 +815,13 @@ impl MultiTokenManager {
                     has_new_ids = true;
                     id
                 });
-                if cred.machine_id.is_none() {
-                    if let Some(machine_id) =
+                if cred.machine_id.is_none()
+                    && let Some(machine_id) =
                         machine_id::generate_from_credentials(&cred, config_ref)
                     {
                         cred.machine_id = Some(machine_id);
                         has_new_machine_ids = true;
                     }
-                }
                 CredentialEntry {
                     id,
                     credentials: cred.clone(),
@@ -823,6 +836,10 @@ impl MultiTokenManager {
                     last_used_at: None,
                     throttle_count: 0,
                     last_throttled_at: None,
+                    last_throttled_wall: None,
+                    last_refreshed_at: None,
+                    quota_remaining: None,
+                    quota_checked_at: None,
                 }
             })
             .collect();
@@ -860,8 +877,9 @@ impl MultiTokenManager {
             stats_dirty: AtomicBool::new(false),
             rr_counter: AtomicU64::new(0),
             sticky_cache: Mutex::new(HashMap::new()),
+            sticky_hits: AtomicU64::new(0),
+            sticky_misses: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
-            rpm_limiter: crate::kiro::rpm_limiter::RpmLimiter::new(),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -901,9 +919,27 @@ impl MultiTokenManager {
         self.entries.lock().len()
     }
 
+    /// 返回所有未禁用账号的 ID 列表（供后台配额刷新使用）
+    pub fn active_credential_ids(&self) -> Vec<u64> {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| !e.disabled)
+            .map(|e| e.id)
+            .collect()
+    }
+
     /// 获取可用账号数量
     pub fn available_count(&self) -> usize {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
+    }
+
+    /// 返回 (sticky_hits, sticky_misses) 累计计数
+    pub fn sticky_metrics(&self) -> (u64, u64) {
+        (
+            self.sticky_hits.load(Ordering::Relaxed),
+            self.sticky_misses.load(Ordering::Relaxed),
+        )
     }
 
     /// 根据负载均衡模式选择下一个账号
@@ -952,41 +988,25 @@ impl MultiTokenManager {
             .collect();
         let health_pool: &[&CredentialEntry] = if preferred.is_empty() { &available } else { &preferred };
 
-        // RPM 限流过滤：跳过当前 60s 窗口已达单账号阈值的账号。
-        // 若全局已达兜底上限，或所有账号都到顶 → 返回 None（上层触发对客户端的退避，不往 AWS 灌）。
-        let rl = &self.config.rate_limit;
-        let pool_vec: Vec<&CredentialEntry> = if rl.enabled {
-            // 全局兜底：超过 global_rpm 直接拒绝本次选号
-            if !self.rpm_limiter.global_under_limit(rl.global_rpm) {
-                tracing::warn!(
-                    evt = "rpm_global_limited",
-                    global_rpm = self.rpm_limiter.global_rpm(),
-                    global_limit = rl.global_rpm,
-                    "全局 RPM 达上限，拒绝选号以触发客户端退避"
-                );
-                return None;
-            }
-            let filtered: Vec<&CredentialEntry> = health_pool
+        // P2 配额感知选号（默认关闭）：过滤掉余量≈0 的账号，但绝不清空池。
+        // quota_remaining=None（未知）视为可用，不误杀。
+        let quota_filtered: Vec<&CredentialEntry>;
+        let pool: &[&CredentialEntry] = if self.config.quota_aware_selection {
+            let has_quota: Vec<&CredentialEntry> = health_pool
                 .iter()
                 .copied()
-                .filter(|e| {
-                    let limit = rl.limit_for(e.credentials.auth_method.as_deref(), e.id);
-                    self.rpm_limiter.credential_under_limit(e.id, limit)
-                })
+                .filter(|e| e.quota_remaining.map(|q| q > 0.0).unwrap_or(true))
                 .collect();
-            if filtered.is_empty() {
-                tracing::warn!(
-                    evt = "rpm_all_limited",
-                    candidates = health_pool.len(),
-                    "所有候选账号均达单账号 RPM 阈值，拒绝选号以触发客户端退避"
-                );
-                return None;
+            if has_quota.is_empty() {
+                // 全部余量耗尽 → 不清空，仍用 health_pool（交由上游 402/禁用逻辑处理）
+                health_pool
+            } else {
+                quota_filtered = has_quota;
+                &quota_filtered
             }
-            filtered
         } else {
-            health_pool.iter().copied().collect()
+            health_pool
         };
-        let pool: &[&CredentialEntry] = &pool_vec;
 
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
@@ -1007,6 +1027,26 @@ impl MultiTokenManager {
                     .collect();
                 if top_tier.len() == 1 {
                     Some((top_tier[0].id, top_tier[0].credentials.clone()))
+                } else if self.config.quota_aware_selection {
+                    // P2：同优先级内偏好余量最高的账号；余量未知（None）排最后作保底。
+                    // 余量相等（或均未知）时退回 round-robin 避免热点。
+                    let best = top_tier
+                        .iter()
+                        .filter(|e| e.quota_remaining.is_some())
+                        .max_by(|a, b| {
+                            a.quota_remaining
+                                .unwrap_or(0.0)
+                                .partial_cmp(&b.quota_remaining.unwrap_or(0.0))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    match best {
+                        Some(entry) => Some((entry.id, entry.credentials.clone())),
+                        None => {
+                            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                            let entry = top_tier[idx % top_tier.len()];
+                            Some((entry.id, entry.credentials.clone()))
+                        }
+                    }
                 } else {
                     let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                     let entry = top_tier[idx % top_tier.len()];
@@ -1015,12 +1055,6 @@ impl MultiTokenManager {
             }
         };
 
-        // 选中后立即预占 RPM 窗口（record-on-select），让飞行中的请求也计入，避免瞬时超发。
-        if rl.enabled {
-            if let Some((id, _)) = &selected {
-                self.rpm_limiter.record(*id);
-            }
-        }
         selected
     }
 
@@ -1055,7 +1089,6 @@ impl MultiTokenManager {
                 let current_hit = if is_balanced {
                     None
                 } else {
-                    let rl = &self.config.rate_limit;
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     entries
@@ -1066,27 +1099,12 @@ impl MultiTokenManager {
                             {
                                 return false;
                             }
-                            // RPM 限流：current 账号也须未达单账号阈值且全局未超限，
-                            // 否则不走 current 快通道，转而走 select_next_credential 轮换。
-                            if rl.enabled {
-                                if !self.rpm_limiter.global_under_limit(rl.global_rpm) {
-                                    return false;
-                                }
-                                let limit = rl.limit_for(e.credentials.auth_method.as_deref(), e.id);
-                                if !self.rpm_limiter.credential_under_limit(e.id, limit) {
-                                    return false;
-                                }
-                            }
                             true
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
                 if let Some(hit) = current_hit {
-                    // 走 current 快通道也要预占 RPM（select_next_credential 被绕过了）
-                    if self.config.rate_limit.enabled {
-                        self.rpm_limiter.record(hit.0);
-                    }
                     hit
                 } else {
                     // 当前账号不可用或 balanced 模式，根据负载均衡策略选择
@@ -1205,6 +1223,7 @@ impl MultiTokenManager {
         continuation_id: Option<&str>,
     ) -> anyhow::Result<CallContext> {
         let Some(cid) = continuation_id else {
+            // 新会话无 continuation_id 是正常流程，不计入 miss，避免稀释真实掉线率
             return self.acquire_context_filtered(model, allowed_ids).await;
         };
 
@@ -1232,23 +1251,9 @@ impl MultiTokenManager {
             }
         };
 
-        // sticky 默认优先保护 prompt cache 命中（同会话黏同一账号），不因轻微超阈就换号。
-        // 但设一个硬上限（阈值 ×1.5）：账号严重超载时驱逐重选，避免单账号失控。
-        let sticky_hard_blocked = if let Some((id, creds)) = cached.as_ref() {
-            let rl = &self.config.rate_limit;
-            if rl.enabled {
-                let base = rl.limit_for(creds.auth_method.as_deref(), *id);
-                // base=0 表示该类型不限制，则 sticky 不拦
-                let hard = if base == 0 { 0 } else { base + base / 2 };
-                let global_blocked = !self.rpm_limiter.global_under_limit(rl.global_rpm);
-                let cred_blocked = !self.rpm_limiter.credential_under_limit(*id, hard);
-                global_blocked || cred_blocked
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        // sticky 默认优先保护 prompt cache 命中（同会话黏同一账号）。
+        // 上游 RPM 限速在 provider 层排队处理（max_rpm_per_credential），这里不再按 RPM 驱逐 sticky。
+        let sticky_hard_blocked = false;
         if sticky_hard_blocked {
             tracing::warn!(
                 evt = "rpm_sticky_evicted",
@@ -1262,10 +1267,8 @@ impl MultiTokenManager {
         if let Some((id, credentials)) = cached.filter(|_| !sticky_hard_blocked) {
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
-                    // 命中成功，续期 + 预占 RPM（sticky 路径绕过了 select_next_credential）
-                    if self.config.rate_limit.enabled {
-                        self.rpm_limiter.record(id);
-                    }
+                    // 命中成功，续期
+                    self.sticky_hits.fetch_add(1, Ordering::Relaxed);
                     self.sticky_cache.lock().entry(cid.to_string()).and_modify(|e| {
                         e.inserted_at = Instant::now();
                     });
@@ -1274,11 +1277,13 @@ impl MultiTokenManager {
                 Err(e) => {
                     tracing::warn!("sticky cache 账号 #{} token 刷新失败，驱逐并重选: {}", id, e);
                     self.sticky_cache.lock().remove(cid);
+                    self.sticky_misses.fetch_add(1, Ordering::Relaxed);
                 }
             }
         } else if !sticky_hard_blocked {
             // TTL 过期或不健康，清理旧条目
             self.sticky_cache.lock().remove(cid);
+            self.sticky_misses.fetch_add(1, Ordering::Relaxed);
         }
 
         // 步骤 ④：走原有选择逻辑
@@ -1334,8 +1339,7 @@ impl MultiTokenManager {
             .iter()
             .filter(|e| !e.disabled)
             .min_by_key(|e| e.credentials.priority)
-        {
-            if best.id != *current_id {
+            && best.id != *current_id {
                 tracing::info!(
                     "优先级变更后切换账号: #{} -> #{}（优先级 {}）",
                     *current_id,
@@ -1344,7 +1348,6 @@ impl MultiTokenManager {
                 );
                 *current_id = best.id;
             }
-        }
     }
 
     /// 尝试使用指定账号获取有效 Token
@@ -1377,29 +1380,43 @@ impl MultiTokenManager {
             };
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                // 确实需要刷新
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                // 冷却期检查：仅对"即将过期"生效，已过期必须立即刷新
+                let skip_for_cooldown = !is_token_expired(&current_creds) && {
+                    let entries = self.entries.lock();
+                    entries.iter().find(|e| e.id == id)
+                        .and_then(|e| e.last_refreshed_at)
+                        .map(|t| t.elapsed() < TOKEN_REFRESH_COOLDOWN)
+                        .unwrap_or(false)
+                };
+                if skip_for_cooldown {
+                    tracing::debug!("Token 即将过期但在冷却期内（30s），跳过刷新");
+                    current_creds
+                } else {
+                    // 确实需要刷新
+                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                    let new_creds =
+                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
 
-                if is_token_expired(&new_creds) {
-                    anyhow::bail!("刷新后的 Token 仍然无效或已过期");
-                }
-
-                // 更新账号
-                {
-                    let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
+                    if is_token_expired(&new_creds) {
+                        anyhow::bail!("刷新后的 Token 仍然无效或已过期");
                     }
-                }
 
-                // 回写账号到文件（仅多账号格式），失败只记录警告
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                }
+                    // 更新账号 + 记录刷新时间
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                            entry.credentials = new_creds.clone();
+                            entry.last_refreshed_at = Some(Instant::now());
+                        }
+                    }
 
-                new_creds
+                    // 回写账号到文件（仅多账号格式），失败只记录警告
+                    if let Err(e) = self.persist_credentials() {
+                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                    }
+
+                    new_creds
+                }
             } else {
                 // 其他请求已经完成刷新，直接使用新账号
                 tracing::debug!("Token 已被其他请求刷新，跳过刷新");
@@ -1528,6 +1545,9 @@ impl MultiTokenManager {
                 entry.success_count = s.success_count;
                 entry.last_used_at = s.last_used_at.clone();
                 entry.throttle_count = s.throttle_count;
+                if let Some(ref ts) = s.last_throttled_wall {
+                    entry.last_throttled_wall = ts.parse::<DateTime<Utc>>().ok();
+                }
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -1553,6 +1573,7 @@ impl MultiTokenManager {
                             success_count: e.success_count,
                             last_used_at: e.last_used_at.clone(),
                             throttle_count: e.throttle_count,
+                            last_throttled_wall: e.last_throttled_wall.map(|t| t.to_rfc3339()),
                         },
                     )
                 })
@@ -1596,6 +1617,24 @@ impl MultiTokenManager {
             return HealthStatus::Disabled;
         }
 
+        // 认证失败（401/403）是严重问题，直接根据次数判断
+        if entry.failure_count >= 3 {
+            return HealthStatus::Unhealthy;
+        }
+        if entry.failure_count >= 2 {
+            return HealthStatus::Degraded;
+        }
+        if entry.failure_count >= 1 {
+            return HealthStatus::Warning;
+        }
+
+        // 限流判断：样本不足时默认健康，避免少量请求时误判
+        let total_calls = entry.success_count + entry.throttle_count;
+        if total_calls < 5 {
+            return HealthStatus::Healthy;
+        }
+
+        let throttle_rate = entry.throttle_count as f64 / total_calls as f64;
         let very_recently_throttled = entry
             .last_throttled_at
             .map(|t| t.elapsed() < StdDuration::from_secs(120))
@@ -1605,22 +1644,11 @@ impl MultiTokenManager {
             .map(|t| t.elapsed() < StdDuration::from_secs(600))
             .unwrap_or(false);
 
-        // 只有样本足够时才计算限流率，避免少量请求时误判
-        let total_calls = entry.success_count + entry.throttle_count;
-        let throttle_rate = if total_calls >= 10 {
-            entry.throttle_count as f64 / total_calls as f64
-        } else {
-            0.0
-        };
-
-        if entry.failure_count >= 2 || (very_recently_throttled && throttle_rate > 0.4) {
+        if very_recently_throttled && throttle_rate > 0.5 {
             HealthStatus::Unhealthy
-        } else if entry.failure_count >= 1
-            || (recently_throttled && throttle_rate > 0.2)
-            || throttle_rate > 0.3
-        {
+        } else if recently_throttled && throttle_rate > 0.3 {
             HealthStatus::Degraded
-        } else if entry.throttle_count > 0 || entry.failure_count > 0 {
+        } else if recently_throttled && throttle_rate > 0.15 {
             HealthStatus::Warning
         } else {
             HealthStatus::Healthy
@@ -1633,6 +1661,7 @@ impl MultiTokenManager {
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
             entry.throttle_count += 1;
             entry.last_throttled_at = Some(Instant::now());
+            entry.last_throttled_wall = Some(Utc::now());
             tracing::debug!(
                 "账号 #{} 被限流（累计 {} 次）",
                 id,
@@ -1947,22 +1976,39 @@ impl MultiTokenManager {
             };
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
-                {
-                    let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
+                // 冷却期检查：仅对"即将过期"生效，已过期必须立即刷新
+                let skip_for_cooldown = !is_token_expired(&current_creds) && {
+                    let entries = self.entries.lock();
+                    entries.iter().find(|e| e.id == id)
+                        .and_then(|e| e.last_refreshed_at)
+                        .map(|t| t.elapsed() < TOKEN_REFRESH_COOLDOWN)
+                        .unwrap_or(false)
+                };
+                if skip_for_cooldown {
+                    tracing::debug!("Token 即将过期但在冷却期内（30s），跳过刷新");
+                    current_creds
+                        .access_token
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("冷却期内无 access_token"))?
+                } else {
+                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                    let new_creds =
+                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                            entry.credentials = new_creds.clone();
+                            entry.last_refreshed_at = Some(Instant::now());
+                        }
                     }
+                    // 持久化失败只记录警告，不影响本次请求
+                    if let Err(e) = self.persist_credentials() {
+                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                    }
+                    new_creds
+                        .access_token
+                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
                 }
-                // 持久化失败只记录警告，不影响本次请求
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                }
-                new_creds
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
             } else {
                 current_creds
                     .access_token
@@ -2010,10 +2056,19 @@ impl MultiTokenManager {
                 }
             };
 
-            if changed {
-                if let Err(e) = self.persist_credentials() {
+            if changed
+                && let Err(e) = self.persist_credentials() {
                     tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
                 }
+        }
+
+        // 写入配额余量缓存（供 P2 配额感知选号使用，机会性更新）
+        {
+            let remaining = (usage_limits.usage_limit() - usage_limits.current_usage()).max(0.0);
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.quota_remaining = Some(remaining);
+                entry.quota_checked_at = Some(Instant::now());
             }
         }
 
@@ -2104,6 +2159,10 @@ impl MultiTokenManager {
                 last_used_at: None,
                 throttle_count: 0,
                 last_throttled_at: None,
+                last_throttled_wall: None,
+                last_refreshed_at: None,
+                quota_remaining: None,
+                quota_checked_at: None,
             });
         }
 
@@ -2386,8 +2445,89 @@ impl Drop for MultiTokenManager {
 }
 
 #[cfg(test)]
+impl MultiTokenManager {
+    /// 测试专用：设置某账号的配额余量缓存
+    fn test_set_quota_remaining(&self, id: u64, remaining: f64) {
+        let mut entries = self.entries.lock();
+        if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
+            e.quota_remaining = Some(remaining);
+            e.quota_checked_at = Some(Instant::now());
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_quota_aware_selection_prefers_higher_quota() {
+        // 两个同优先级账号，开启配额感知后应偏好余量高的
+        let mut config = Config::default();
+        config.quota_aware_selection = true;
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("q-low".to_string());
+        c1.access_token = Some("q-low".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut c2 = KiroCredentials::default();
+        c2.refresh_token = Some("q-high".to_string());
+        c2.access_token = Some("q-high".to_string());
+        c2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // id=1 余量低，id=2 余量高
+        manager.test_set_quota_remaining(1, 5.0);
+        manager.test_set_quota_remaining(2, 500.0);
+
+        // 选号应命中 id=2（余量高）
+        let sel = manager.select_next_credential(None, &[]);
+        assert!(sel.is_some());
+        assert_eq!(sel.unwrap().0, 2, "配额感知应选余量高的 id=2");
+    }
+
+    #[test]
+    fn test_quota_aware_selection_skips_zero_quota() {
+        // 开启配额感知后，余量≈0 的账号被跳过
+        let mut config = Config::default();
+        config.quota_aware_selection = true;
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("zero".to_string());
+        c1.access_token = Some("zero".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut c2 = KiroCredentials::default();
+        c2.refresh_token = Some("ok".to_string());
+        c2.access_token = Some("ok".to_string());
+        c2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        manager.test_set_quota_remaining(1, 0.0);
+        manager.test_set_quota_remaining(2, 100.0);
+
+        // 多轮选号都不应命中余量为 0 的 id=1
+        for _ in 0..5 {
+            let sel = manager.select_next_credential(None, &[]);
+            assert_eq!(sel.unwrap().0, 2, "余量为0的账号应被跳过");
+        }
+    }
+
+    #[test]
+    fn test_quota_aware_disabled_ignores_quota() {
+        // 默认关闭时，配额不影响选号（余量为0也可被选）
+        let config = Config::default(); // quota_aware_selection 默认 false
+        assert!(!config.quota_aware_selection);
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("only".to_string());
+        c1.access_token = Some("only".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
+        manager.test_set_quota_remaining(1, 0.0);
+        // 关闭时即使余量0也能选中（不误杀唯一账号）
+        let sel = manager.select_next_credential(None, &[]);
+        assert_eq!(sel.unwrap().0, 1);
+    }
 
     #[test]
     fn test_token_manager_new() {
